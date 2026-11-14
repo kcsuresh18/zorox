@@ -291,9 +291,6 @@ class _GoldenSubtitleStyleDrawerState
                 settings: settings,
                 onPosition: (raise) =>
                     widget.notifier.setSubtitleRaise(raise),
-                onNudge: (step) => widget.notifier.setSubtitleRaise(
-                  settings.subtitleRaise + step,
-                ),
               ),
               _StepperRow(
                 icon: Icons.opacity_rounded,
@@ -841,34 +838,27 @@ class _ToggleRow extends StatelessWidget {
   }
 }
 
-/// Position: Bottom / Middle / Top, plus the −10/−5/+5/+10 nudge pills.
+/// Position: Bottom / Middle / Top.
 ///
 /// The stock model is a lift in [0, 0.2] of the picture's height, so the
 /// three positions are the ends and the middle of that range (0 / 0.1 /
-/// 0.2) and the pills nudge by ∓0.1 / ∓0.05, exactly the stock nudge. The
-/// pill matching the current lift over the position's base is gold.
+/// 0.2). Fine adjustment is the swipe on the video, not buttons: a
+/// horizontal swipe lifts the caption to the right and drops it to the
+/// left, and the centre-third vertical slide does the same up and down
+/// (+25/+26) — the fiddly −10/−5/+5/+10 pills are gone.
 class _PositionRow extends StatelessWidget {
   const _PositionRow({
     required this.settings,
     required this.onPosition,
-    required this.onNudge,
   });
 
   final PlayerSettings settings;
   final ValueChanged<double> onPosition;
-  final ValueChanged<double> onNudge;
 
   static const List<(String, double)> _positions = <(String, double)>[
     ('Bottom', 0.0),
     ('Middle', 0.1),
     ('Top', 0.2),
-  ];
-
-  static const List<(String, double)> _nudges = <(String, double)>[
-    ('−10', -0.1),
-    ('−5', -0.05),
-    ('+5', 0.05),
-    ('+10', 0.1),
   ];
 
   double get _base {
@@ -894,155 +884,90 @@ class _PositionRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final offset = settings.subtitleRaise - _base;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 7),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      child: Row(
         children: <Widget>[
-          Row(
-            children: <Widget>[
-              const Icon(
-                Icons.vertical_align_bottom_rounded,
-                size: 20,
-                color: GoldenPlayerColors.gold,
-              ),
-              const SizedBox(width: 12),
-              const Expanded(
-                child: Text(
-                  'Position',
-                  style: TextStyle(
-                    color: GoldenPlayerColors.textPrimary,
-                    fontWeight: FontWeight.w600,
-                    fontSize: 14,
-                  ),
-                ),
-              ),
-              PopupMenuButton<double>(
-                onSelected: onPosition,
-                color: GoldenPlayerColors.surface,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(
-                    GoldenPlayerRadii.card,
-                  ),
-                  side: const BorderSide(
-                    color: GoldenPlayerColors.divider,
-                  ),
-                ),
-                itemBuilder: (context) => <PopupMenuEntry<double>>[
-                  for (final (name, value) in _positions)
-                    PopupMenuItem<double>(
-                      value: value,
-                      child: Text(
-                        name,
-                        style: TextStyle(
-                          color: value == _base
-                              ? GoldenPlayerColors.goldHighlight
-                              : GoldenPlayerColors.textPrimary,
-                          fontWeight: value == _base
-                              ? FontWeight.w700
-                              : FontWeight.w500,
-                        ),
-                      ),
-                    ),
-                ],
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 7,
-                  ),
-                  decoration: BoxDecoration(
-                    color: GoldenPlayerColors.surface,
-                    borderRadius: BorderRadius.circular(
-                      GoldenPlayerRadii.pill,
-                    ),
-                    border: Border.all(
-                      color: GoldenPlayerColors.divider,
-                    ),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: <Widget>[
-                      Text(
-                        _positionName,
-                        style: const TextStyle(
-                          color: GoldenPlayerColors.textPrimary,
-                          fontWeight: FontWeight.w600,
-                          fontSize: 13,
-                        ),
-                      ),
-                      const SizedBox(width: 4),
-                      const Icon(
-                        Icons.keyboard_arrow_down_rounded,
-                        size: 18,
-                        color: GoldenPlayerColors.textSecondary,
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ],
+          const Icon(
+            Icons.vertical_align_bottom_rounded,
+            size: 20,
+            color: GoldenPlayerColors.gold,
           ),
-          const SizedBox(height: 8),
-          Row(
-            children: <Widget>[
-              const SizedBox(width: 32),
-              for (final (label, step) in _nudges)
-                Padding(
-                  padding: const EdgeInsets.only(right: 8),
-                  child: _NudgePill(
-                    label: label,
-                    selected: (offset - step).abs() < 0.001,
-                    onTap: () => onNudge(step),
+          const SizedBox(width: 12),
+          const Expanded(
+            child: Text(
+              'Position',
+              style: TextStyle(
+                color: GoldenPlayerColors.textPrimary,
+                fontWeight: FontWeight.w600,
+                fontSize: 14,
+              ),
+            ),
+          ),
+          PopupMenuButton<double>(
+            onSelected: onPosition,
+            color: GoldenPlayerColors.surface,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(
+                GoldenPlayerRadii.card,
+              ),
+              side: const BorderSide(
+                color: GoldenPlayerColors.divider,
+              ),
+            ),
+            itemBuilder: (context) => <PopupMenuEntry<double>>[
+              for (final (name, value) in _positions)
+                PopupMenuItem<double>(
+                  value: value,
+                  child: Text(
+                    name,
+                    style: TextStyle(
+                      color: value == _base
+                          ? GoldenPlayerColors.goldHighlight
+                          : GoldenPlayerColors.textPrimary,
+                      fontWeight: value == _base
+                          ? FontWeight.w700
+                          : FontWeight.w500,
+                    ),
                   ),
                 ),
             ],
+            child: Container(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 12,
+                vertical: 7,
+              ),
+              decoration: BoxDecoration(
+                color: GoldenPlayerColors.surface,
+                borderRadius: BorderRadius.circular(
+                  GoldenPlayerRadii.pill,
+                ),
+                border: Border.all(
+                  color: GoldenPlayerColors.divider,
+                ),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Text(
+                    _positionName,
+                    style: const TextStyle(
+                      color: GoldenPlayerColors.textPrimary,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const SizedBox(width: 4),
+                  const Icon(
+                    Icons.keyboard_arrow_down_rounded,
+                    size: 18,
+                    color: GoldenPlayerColors.textSecondary,
+                  ),
+                ],
+              ),
+            ),
           ),
         ],
-      ),
-    );
-  }
-}
-
-class _NudgePill extends StatelessWidget {
-  const _NudgePill({
-    required this.label,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final String label;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(GoldenPlayerRadii.pill),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        decoration: BoxDecoration(
-          color: selected
-              ? GoldenPlayerColors.gold
-              : GoldenPlayerColors.surface,
-          borderRadius: BorderRadius.circular(GoldenPlayerRadii.pill),
-          border: Border.all(
-            color: selected
-                ? Colors.transparent
-                : GoldenPlayerColors.divider,
-          ),
-        ),
-        child: Text(
-          label,
-          style: TextStyle(
-            color: selected
-                ? Colors.black
-                : GoldenPlayerColors.textPrimary,
-            fontWeight: FontWeight.w700,
-            fontSize: 12,
-          ),
-        ),
       ),
     );
   }

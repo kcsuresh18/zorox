@@ -825,6 +825,18 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
         await applyMpvAndroidOptions(platform);
       }
     }
+    // Subtitle options for every platform (+26): mpv's `secondary-sid`
+    // defaults to `auto`, which can pick a second same-language track
+    // as a secondary subtitle — and media_kit's SubtitleView renders
+    // both the primary and the secondary text, so the cue would show
+    // twice. The app has no dual-subtitle feature, so the secondary
+    // track is off, always (see applyMpvSubtitleOptions). Best-effort
+    // like the Android options above; a failure leaves media_kit's
+    // defaults in place and the open still goes ahead.
+    final subtitlePlatform = _player.platform;
+    if (subtitlePlatform is NativePlayer) {
+      await applyMpvSubtitleOptions(subtitlePlatform);
+    }
     // The mid-playback stall watchdog: a tick every 2s that asks whether
     // the playhead has moved, and recovers the source when it has not
     // (see _onStallTick). It stands down while the screen is gone.

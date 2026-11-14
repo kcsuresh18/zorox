@@ -114,6 +114,52 @@ Future<void> applyMpvAndroidOptions(NativePlayer platform) async {
   }
 }
 
+/// Cross-platform subtitle options (iOS AND Android — unlike the
+/// Android-only map above), as `option → value`.
+///
+/// The one entry is `secondary-sid: no` (+26). Why: media_kit's
+/// subtitle state is a two-slot list — the primary `sub-text` and the
+/// secondary `secondary-sub-text` — and its SubtitleView renders BOTH
+/// (media_kit 1.2.6 `real.dart`: the `sub-text` and
+/// `secondary-sub-text` observers each fill one slot, and
+/// `SubtitleView` joins every non-empty line). mpv's `secondary-sid`
+/// defaults to `auto`, which can pick a second same-language track
+/// (e.g. English SDH next to English) as the secondary subtitle — and
+/// then the same cue arrives in both slots and the caption shows
+/// twice, four lines instead of two. The app has no dual-subtitle
+/// feature and never selects a secondary track, so the secondary slot
+/// is off, always. The primary track (`sid`, set through
+/// `setSubtitleTrack`) is untouched by this option.
+///
+/// Deliberately NOT here: `sid` itself, and any `sub-*` presentation
+/// option — the Flutter overlay owns the caption's style and position,
+/// and mpv's native rendering stays off (`libass: false` in the
+/// PlayerConfiguration, so `sub-visibility` is already `no`).
+const Map<String, String> kMpvSubtitleOptions = <String, String>{
+  'secondary-sid': 'no',
+};
+
+/// Applies [kMpvSubtitleOptions] to a player's mpv instance, then reads
+/// `secondary-sid` back so the log shows what was set. Same best-effort
+/// shape as [applyMpvAndroidOptions]: a single option failing must not
+/// break the open.
+Future<void> applyMpvSubtitleOptions(NativePlayer platform) async {
+  for (final entry in kMpvSubtitleOptions.entries) {
+    try {
+      await platform.setProperty(entry.key, entry.value);
+    } catch (e) {
+      debugPrint('[mpv] subtitle option ${entry.key} not applied: $e');
+    }
+  }
+  try {
+    final secondarySid = await platform.getProperty('secondary-sid');
+    debugPrint('[mpv] secondary-sid: $secondarySid (subtitle options '
+        'applied)');
+  } catch (e) {
+    debugPrint('[mpv] secondary-sid read-back failed: $e');
+  }
+}
+
 /// One-time diagnostic: reads the decoder actually engaged back from
 /// mpv and prints it. Call once, on first play — before the first frame
 /// `hwdec-current` is empty, so reading it earlier proves nothing.

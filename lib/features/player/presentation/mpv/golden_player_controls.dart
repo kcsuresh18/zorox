@@ -84,6 +84,17 @@ double subtitleRaiseAfterSlide(double startRaise, double travel) {
       .toDouble();
 }
 
+/// The subtitle raise a horizontal swipe lands on: [dxShare] is the share
+/// of the screen's width the finger moved, rightward positive — a right
+/// swipe lifts the caption, a left swipe drops it (+26). A full screen of
+/// travel is the whole raise range, the same rule as the vertical slide.
+double subtitleRaiseAfterHorizontalSwipe(
+  double startRaise,
+  double dxShare,
+) {
+  return subtitleRaiseAfterSlide(startRaise, dxShare);
+}
+
 class GoldenPlayerControls extends ConsumerStatefulWidget {
   const GoldenPlayerControls({
     required this.controller,
@@ -218,16 +229,20 @@ class _GoldenPlayerControlsState
   double _pinchStartScale = 1.0;
 
   // -- vertical swipe rails (volume right / brightness left / subtitles
-  // centre) ---------------------------------------------------------------
+  // centre) + the horizontal subtitle swipe -------------------------------
   //
   // One scale recognizer owns the single-finger pan and the pinch together
   // (the stock chrome's shape): the axis is decided once, from the down
   // point, and a clearly vertical pan becomes a rail. Right third = the
   // mpv volume, left third = the screen brightness, through the same seam
   // the stock chrome uses ([PlatformPlayerBrightness]); the centre third
-  // slides the subtitle up and down (+25). The thirds mirror the
-  // double-tap zones (outer thirds seek, centre toggles play), so a thumb
-  // already knows where it is.
+  // slides the subtitle up and down (+25). A clearly horizontal pan is
+  // the subtitle's sideways control instead (+26): right lifts the
+  // caption, left drops it, anywhere on the video — no other gesture
+  // uses a horizontal pan, so there is no zone to fight over. The thirds
+  // mirror the double-tap zones (outer thirds seek, centre toggles play),
+  // so a thumb already knows where it is. A pan is one axis or the other,
+  // never both, so the two subtitle swipes cannot fight each other.
   _GoldenPanAxis _panAxis = _GoldenPanAxis.none;
 
   /// The down point the pan's travel is measured from, landed by a
@@ -461,14 +476,20 @@ class _GoldenPlayerControlsState
         // since the down point in one go, and the updates that follow it
         // each apply only their own.
         _updateRail(travel.dy);
+      } else {
+        // The horizontal swipe is the subtitle's sideways control (+26):
+        // right lifts the caption, left drops it. Like the vertical rail,
+        // this update applies the whole travel since the down point in
+        // one go, and the updates that follow it each apply only their own.
+        _beginHorizontalSubtitleSwipe();
+        _updateSubtitleHorizontal(travel.dx);
       }
-      // A horizontal pan does nothing: the Golden player has no
-      // swipe-seek, and the axis stays horizontal so a later update
-      // cannot turn it into a rail.
       return;
     }
     if (_panAxis == _GoldenPanAxis.vertical) {
       _updateRail(d.focalPointDelta.dy);
+    } else if (_panAxis == _GoldenPanAxis.horizontal) {
+      _updateSubtitleHorizontal(d.focalPointDelta.dx);
     }
   }
 
@@ -501,13 +522,44 @@ class _GoldenPlayerControlsState
       _panAnchorLocalX = null;
       return;
     }
-    // The last pointer lifted: the pan commits.
-    if (_panAxis == _GoldenPanAxis.vertical) {
+    // The last pointer lifted: the pan commits. A rail in flight — the
+    // vertical slide or the horizontal subtitle swipe — hides on its
+    // clock; the axis stays horizontal or vertical for the gesture's
+    // life, so a rail can only be in flight on its own axis.
+    if (_dragRail != null) {
       _railDragEnd();
     }
     _panAxis = _GoldenPanAxis.none;
     _panAnchor = null;
     _panAnchorLocalX = null;
+  }
+
+  /// Starts a horizontal subtitle swipe (+26): the swipe is the sideways
+  /// control for the caption's raise — right lifts, left drops — and it
+  /// runs anywhere on the video, because no other gesture uses a
+  /// horizontal pan. It is the subtitle rail, so the same indicator
+  /// shows the new raise live. The raise reads synchronously from the
+  /// settings, so there is nothing to wait for — unlike brightness,
+  /// which the vertical rail reads async.
+  void _beginHorizontalSubtitleSwipe() {
+    if (!_isTouch) return;
+    _dragId++;
+    _dragRail = _GoldenRailKind.subtitle;
+    _dragReady = true;
+    _dragPending = 0;
+    _dragStart = widget.settings.value.subtitleRaise;
+  }
+
+  /// Moves the caption's raise by a horizontal swipe: [dx] is the
+  /// finger's travel in logical pixels since the last update, rightward
+  /// positive. A full screen width of travel is the whole raise range —
+  /// the same rule as the vertical slide — so the swipe's feel matches
+  /// it. Right is up, left is down.
+  void _updateSubtitleHorizontal(double dx) {
+    if (_dragRail != _GoldenRailKind.subtitle) return;
+    final width = context.size?.width ?? 0;
+    if (width <= 0) return;
+    _railTravel(_GoldenRailKind.subtitle, dx / width);
   }
 
   /// Starts a vertical rail from the down point's third: brightness on the
@@ -582,7 +634,9 @@ class _GoldenPlayerControlsState
         // The subtitle slides on the same rule as the other rails: a full
         // screen of travel is the whole raise range. The raise is
         // persisted through the settings, so it survives reopening, and
-        // the Style tab's Position and nudge buttons read the same value.
+        // the Style tab's Position dropdown and both swipes — the
+        // centre-third vertical slide and the horizontal swipe — read
+        // the same value.
         final raise = subtitleRaiseAfterSlide(_dragStart, travel);
         _dragStart = raise;
         unawaited(widget.settingsNotifier.setSubtitleRaise(raise));
@@ -758,7 +812,9 @@ class _GoldenPlayerControlsState
         // The gesture layer: tap toggles the chrome, double-tap seeks
         // on the outer thirds and toggles play/pause in the centre
         // third, long-press (right half) holds 2x, pinch zooms,
-        // vertical swipe rails volume (right) / brightness (left).
+        // vertical swipe rails volume (right) / brightness (left) /
+        // subtitle (centre), and a horizontal swipe moves the subtitle
+        // up to the right and down to the left.
         // Locked, only a bare tap and the outer-third double-tap seek
         // survive — the tap asks to see the unlock chip, the double-tap
         // skips ±10s; nothing else answers a finger.

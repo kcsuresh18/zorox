@@ -20,9 +20,11 @@
 ///     `subtitleShadow` flag for a drop shadow (the stock outline enum has
 ///     no shadow; libVLC ignores the flag);
 ///   * position — the stock `subtitleRaise`, a share of the picture's height
-///     the lines are lifted from the bottom. The Style tab's slider and its
-///     +5/+10/−5/−10 nudge buttons both write it, through
-///     `setSubtitleRaise`, which holds it to the stock range [0, 0.2].
+///     the lines are lifted from the bottom. The Style tab's Position
+///     dropdown writes it, and so do the swipes on the video (horizontal:
+///     right lifts, left drops; centre-third vertical: up lifts, down
+///     drops), through `setSubtitleRaise`, which holds it to the stock
+///     range [0, 0.2].
 library;
 
 import 'package:flutter/material.dart';
@@ -59,11 +61,6 @@ const List<(String label, double opacity)> kMpvSubtitleBackgrounds =
 
 /// The Style tab's edge choices.
 const List<String> kMpvSubtitleEdges = <String>['None', 'Outline', 'Shadow'];
-
-/// The nudge buttons' steps, in lift units: +5/−5 moves 0.05, +10/−10 moves
-/// 0.1 — the stock raise values themselves, so a nudge always lands on one.
-const double kMpvRaiseNudgeSmall = 0.05;
-const double kMpvRaiseNudgeLarge = 0.1;
 
 /// The bottom padding the caption sits at, in every chrome state — one
 /// fixed value (+25). It used to be 40px with the bars hidden and 116px
