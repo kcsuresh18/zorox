@@ -156,7 +156,10 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       host.layer.addSublayer(displayLayer)
       rootView.insertSubview(host, at: 0)
 
-      let tb = CMTimebase(masterClock: CMClockGetHostTimeClock())
+      // CMTimebase(masterClock:) throws in this SDK; a failed timebase
+      // means PiP cannot be prepared.
+      guard let tb = try? CMTimebase(masterClock: CMClockGetHostTimeClock())
+      else { return false }
       displayLayer.controlTimebase = tb
 
       let source = AVPictureInPictureController.ContentSource(
@@ -189,8 +192,13 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
         object: nil,
         queue: nil
       ) { [weak self] note in
-        guard let pb = note.object as? CVPixelBuffer else { return }
-        self?.ingest(pb)
+        // Swift 6 flags a conditional downcast from Any to the CF type
+        // CVPixelBuffer as always succeeding, so check the
+        // CoreFoundation type ID first, then force-cast.
+        guard let obj = note.object,
+              CFGetTypeID(obj as CFTypeRef) == CVPixelBufferGetTypeID()
+        else { return }
+        self?.ingest(obj as! CVPixelBuffer)
       }
     }
 
@@ -404,13 +412,22 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     guard st == noErr, let s = sb else { return }
     // mpv already timed the display; without this, frames judged late
     // are dropped silently — the classic black or frozen PiP.
-    if let atts = CMSampleBufferGetSampleAttachmentsArray(
+    // The dictionaries returned by CMSampleBufferGetSampleAttachmentsArray
+    // are the sample buffer's live attachments, so mutating the first
+    // one in place is enough — no setter call needed.
+    // (CMSampleBufferSetSampleAttachmentsArray is not visible to Swift
+    // in this SDK, and the old code also subscripted the array itself
+    // with a String key instead of its first dictionary.)
+    if let attachments = CMSampleBufferGetSampleAttachmentsArray(
       s,
       createIfNecessary: true
-    ) as? [[String: Any]] {
-      var m = atts
-      m[kCMSampleAttachmentKey_DisplayImmediately as String] = true
-      CMSampleBufferSetSampleAttachmentsArray(s, sampleAttachmentsArray: m as CFArray)
+    ) as? [NSMutableDictionary],
+      let dict = attachments.first
+    {
+      dict.setObject(
+        true,
+        forKey: kCMSampleAttachmentKey_DisplayImmediately as NSString
+      )
     }
     layer.enqueue(s)
     frameCount += 1
@@ -459,12 +476,9 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     )
   }
 
-  public func pictureInPictureController(
-    _ controller: AVPictureInPictureController,
-    didTransitionToRenderSize newRenderSize: CMVideoSize
-  ) {
-    // Aspect is preserved by the layer's .resizeAspect gravity.
-  }
+  // didTransitionToRenderSize is intentionally omitted: CMVideoSize is
+  // not in scope for Swift in this SDK, and the method would be a no-op
+  // anyway — aspect is preserved by the layer's .resizeAspect gravity.
 
   public func pictureInPictureControllerIsPlaybackPaused(
     _ controller: AVPictureInPictureController
