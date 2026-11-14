@@ -69,6 +69,21 @@ enum _GoldenDrawerKind { none, episodes, subtitleStyle, audio, sources }
 /// or the other — never both, and never a rail that becomes a seek.
 enum _GoldenPanAxis { none, horizontal, vertical }
 
+/// Which vertical rail a pan is driving: the mpv volume (right third), the
+/// screen brightness (left third), or the subtitle position (centre third,
+/// +25).
+enum _GoldenRailKind { volume, brightness, subtitle }
+
+/// The subtitle raise a centre-third vertical slide lands on: [travel] is
+/// the share of the screen's height the finger moved, upward positive, and
+/// a full screen of travel is the whole raise range — the same rule the
+/// volume and brightness rails use. Held to [kSubtitleRaises]' range.
+double subtitleRaiseAfterSlide(double startRaise, double travel) {
+  return (startRaise + travel * kSubtitleRaises.last)
+      .clamp(kSubtitleRaises.first, kSubtitleRaises.last)
+      .toDouble();
+}
+
 class GoldenPlayerControls extends ConsumerStatefulWidget {
   const GoldenPlayerControls({
     required this.controller,
@@ -202,13 +217,17 @@ class _GoldenPlayerControlsState
   bool _pinching = false;
   double _pinchStartScale = 1.0;
 
-  // -- vertical swipe rails (volume right / brightness left) --------------
+  // -- vertical swipe rails (volume right / brightness left / subtitles
+  // centre) ---------------------------------------------------------------
   //
   // One scale recognizer owns the single-finger pan and the pinch together
   // (the stock chrome's shape): the axis is decided once, from the down
-  // point, and a clearly vertical pan becomes a rail. Right half = the
-  // mpv volume, left half = the screen brightness, through the same seam
-  // the stock chrome uses ([PlatformPlayerBrightness]).
+  // point, and a clearly vertical pan becomes a rail. Right third = the
+  // mpv volume, left third = the screen brightness, through the same seam
+  // the stock chrome uses ([PlatformPlayerBrightness]); the centre third
+  // slides the subtitle up and down (+25). The thirds mirror the
+  // double-tap zones (outer thirds seek, centre toggles play), so a thumb
+  // already knows where it is.
   _GoldenPanAxis _panAxis = _GoldenPanAxis.none;
 
   /// The down point the pan's travel is measured from, landed by a
@@ -217,12 +236,11 @@ class _GoldenPlayerControlsState
   Offset? _panAnchor;
   double? _panAnchorLocalX;
 
-  /// Whether the rail in flight is volume (true) or brightness (false);
-  /// null when no rail is down.
-  bool? _dragIsVolume;
+  /// The rail in flight, or null when no rail is down.
+  _GoldenRailKind? _dragRail;
 
   /// The level the swipe counts from, and the running level as the travel
-  /// lands: volume 0..100, brightness 0..1.
+  /// lands: volume 0..100, brightness 0..1, subtitle raise 0..0.2.
   double _dragStart = 0;
 
   /// Whether the start level has been read. The brightness read is async,
@@ -492,27 +510,35 @@ class _GoldenPlayerControlsState
     _panAnchorLocalX = null;
   }
 
-  /// Starts a brightness or volume rail: brightness on the left half,
-  /// volume on the right. [localX] is the finger's x in this detector's
-  /// coordinates, which is what decides the half.
+  /// Starts a vertical rail from the down point's third: brightness on the
+  /// left third, volume on the right third, subtitle position in the centre
+  /// third (+25). [localX] is the finger's x in this detector's
+  /// coordinates, which is what decides the third.
   Future<void> _beginRail(double localX) async {
     if (!_isTouch) {
-      _dragIsVolume = null;
+      _dragRail = null;
       return;
     }
     final width = context.size?.width ?? 0;
     if (width <= 0) return;
-    final isVolume = localX >= width / 2;
+    final kind = localX < width / 3
+        ? _GoldenRailKind.brightness
+        : localX > 2 * width / 3
+            ? _GoldenRailKind.volume
+            : _GoldenRailKind.subtitle;
     final id = ++_dragId;
-    _dragIsVolume = isVolume;
+    _dragRail = kind;
     _dragReady = false;
     _dragPending = 0;
-    // Read as each swipe starts, as the stock chrome does: the level can
-    // have moved with no word to the player — Control Center or the
+    // The subtitle rail and the volume read synchronously: the raise is
+    // the settings' own value, the volume the controller's own. Brightness
+    // is read as each swipe starts, as the stock chrome does: the level
+    // can have moved with no word to the player — Control Center or the
     // notification shade move the brightness. A platform with no answer
-    // carries on from the mirrored one. The volume is the controller's
-    // own value, read synchronously.
-    if (isVolume) {
+    // carries on from the mirrored one.
+    if (kind == _GoldenRailKind.subtitle) {
+      _dragStart = widget.settings.value.subtitleRaise;
+    } else if (kind == _GoldenRailKind.volume) {
       _dragStart = widget.controller.value.volume.toDouble();
     } else {
       final level = await _brightnessControl.read();
@@ -526,7 +552,7 @@ class _GoldenPlayerControlsState
     // A flick can end before the read lands: its travel still counts, and
     // the rail then keeps its own clock.
     if (pending != 0) {
-      _railTravel(isVolume, pending, live: _dragIsVolume == isVolume);
+      _railTravel(kind, pending, live: _dragRail == kind);
     }
   }
 
@@ -534,8 +560,8 @@ class _GoldenPlayerControlsState
   ///
   /// [primaryDelta] is the finger's vertical travel since the last update.
   void _updateRail(double primaryDelta) {
-    final isVolume = _dragIsVolume;
-    if (isVolume == null) return;
+    final kind = _dragRail;
+    if (kind == null) return;
     final height = context.size?.height ?? 0;
     if (height <= 0) return;
 
@@ -544,42 +570,60 @@ class _GoldenPlayerControlsState
       _dragPending += travel;
       return;
     }
-    _railTravel(isVolume, travel);
+    _railTravel(kind, travel);
   }
 
   /// Moves the swipe's level by [travel], a share of the screen's height,
   /// and applies it. Not [live]: the finger has already lifted, so the
   /// rail hides on its own clock.
-  void _railTravel(bool isVolume, double travel, {bool live = true}) {
-    if (isVolume) {
-      // The Golden player's volume is 0..100, matching its volume sheet;
-      // no boost past 100% on a swipe.
-      final level = (_dragStart + travel * 100).clamp(0.0, 100.0);
-      _dragStart = level;
-      unawaited(widget.controller.setVolume(level.round()));
-      _rail.show(
-        _GoldenRailData(
-          icon: _volumeIcon(level),
-          value: level / 100,
-          label: '${level.round()}%',
-          onLeft: false,
-        ),
-        hideAfter: live ? null : const Duration(milliseconds: 900),
-      );
-    } else {
-      _dragStart = (_dragStart + travel).clamp(0.0, 1.0);
-      _brightness = _dragStart;
-      _brightnessOverridden = true;
-      _brightnessControl.set(_brightness);
-      _rail.show(
-        _GoldenRailData(
-          icon: _brightnessIcon(_brightness),
-          value: _brightness,
-          label: '${(_brightness * 100).round()}%',
-          onLeft: true,
-        ),
-        hideAfter: live ? null : const Duration(milliseconds: 500),
-      );
+  void _railTravel(_GoldenRailKind kind, double travel, {bool live = true}) {
+    switch (kind) {
+      case _GoldenRailKind.subtitle:
+        // The subtitle slides on the same rule as the other rails: a full
+        // screen of travel is the whole raise range. The raise is
+        // persisted through the settings, so it survives reopening, and
+        // the Style tab's Position and nudge buttons read the same value.
+        final raise = subtitleRaiseAfterSlide(_dragStart, travel);
+        _dragStart = raise;
+        unawaited(widget.settingsNotifier.setSubtitleRaise(raise));
+        _rail.show(
+          _GoldenRailData(
+            icon: Icons.closed_caption_rounded,
+            value: raise / kSubtitleRaises.last,
+            label: '${(raise / kSubtitleRaises.last * 100).round()}%',
+            onLeft: false,
+          ),
+          hideAfter: live ? null : const Duration(milliseconds: 900),
+        );
+      case _GoldenRailKind.volume:
+        // The Golden player's volume is 0..100, matching its volume sheet;
+        // no boost past 100% on a swipe.
+        final level = (_dragStart + travel * 100).clamp(0.0, 100.0);
+        _dragStart = level;
+        unawaited(widget.controller.setVolume(level.round()));
+        _rail.show(
+          _GoldenRailData(
+            icon: _volumeIcon(level),
+            value: level / 100,
+            label: '${level.round()}%',
+            onLeft: false,
+          ),
+          hideAfter: live ? null : const Duration(milliseconds: 900),
+        );
+      case _GoldenRailKind.brightness:
+        _dragStart = (_dragStart + travel).clamp(0.0, 1.0);
+        _brightness = _dragStart;
+        _brightnessOverridden = true;
+        _brightnessControl.set(_brightness);
+        _rail.show(
+          _GoldenRailData(
+            icon: _brightnessIcon(_brightness),
+            value: _brightness,
+            label: '${(_brightness * 100).round()}%',
+            onLeft: true,
+          ),
+          hideAfter: live ? null : const Duration(milliseconds: 500),
+        );
     }
   }
 
@@ -597,7 +641,7 @@ class _GoldenPlayerControlsState
   }
 
   void _railDragEnd() {
-    _dragIsVolume = null;
+    _dragRail = null;
     _rail.clearAfter(const Duration(milliseconds: 1500));
   }
 
@@ -991,19 +1035,27 @@ class _GoldenPlayerControlsState
             child: AnimatedOpacity(
               opacity: chromeVisible ? 1.0 : 0.0,
               duration: GoldenPlayerMotion.normal,
-              child: GoldenPill(
-                filled: true,
-                onTap: () {
-                  widget.locked?.value = false;
-                  widget.chrome.poke();
-                },
-                child: const Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: <Widget>[
-                    Icon(Icons.lock_open_rounded, size: 16),
-                    SizedBox(width: 6),
-                    Text('Tap to unlock'),
-                  ],
+              // The IgnorePointer is load-bearing, as in the stock chrome
+              // (+25): `AnimatedOpacity` at zero paints nothing but still
+              // hit-tests, so without it an invisible pill would sit in
+              // the middle of a locked screen and the first tap meant to
+              // show the pill would unlock instead.
+              child: IgnorePointer(
+                ignoring: !chromeVisible,
+                child: GoldenPill(
+                  filled: true,
+                  onTap: () {
+                    widget.locked?.value = false;
+                    widget.chrome.poke();
+                  },
+                  child: const Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Icon(Icons.lock_open_rounded, size: 16),
+                      SizedBox(width: 6),
+                      Text('Tap to unlock'),
+                    ],
+                  ),
                 ),
               ),
             ),

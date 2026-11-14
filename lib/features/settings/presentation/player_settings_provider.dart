@@ -475,9 +475,33 @@ class PlayerSettingsNotifier extends _$PlayerSettingsNotifier {
       (e) => e.name == storage.getPlayerSetting<String>('player_sub_outline'),
       orElse: () => SubtitleOutline.thin,
     );
-    final subRaise =
-        (storage.getPlayerSetting('player_sub_raise') as num?)?.toDouble() ??
-        0.0;
+    // +25: the saved raise is reset to 0 once. The raise is what put the
+    // "default" caption ~140px up on a phone in landscape — the 40px base
+    // plus a 0.2 raise over a ~393px height — and it was set through the
+    // fiddly Position control, so it is not a deliberate choice to keep.
+    // The user asked for the caption to sit close to the bottom edge by
+    // default, and the slide gesture (also +25) is the way to move it from
+    // there. The flag makes it one-shot: a raise the viewer sets after
+    // this sticks, and a fresh install (no stored raise) is untouched.
+    final subRaiseStored =
+        (storage.getPlayerSetting('player_sub_raise') as num?)?.toDouble();
+    final subRaiseReset =
+        storage.getPlayerSetting<bool>(
+              'player_sub_raise_v25_reset',
+              defaultValue: false,
+            ) ??
+            false;
+    final subRaise = subRaiseReset ? (subRaiseStored ?? 0.0) : 0.0;
+    if (!subRaiseReset) {
+      // Fire and forget: the in-memory value above is already 0, so the
+      // player shows the low default on this very launch; the writes only
+      // make it stick. The same one-shot migration shape the password
+      // move out of Hive uses in this file.
+      unawaited(storage.setPlayerSetting('player_sub_raise', 0.0));
+      unawaited(
+        storage.setPlayerSetting('player_sub_raise_v25_reset', true),
+      );
+    }
     final subBold =
         storage.getPlayerSetting<bool>(
           'player_sub_bold',

@@ -726,6 +726,51 @@ void main() {
       expect(settings.subtitleEncoding, isEmpty);
     });
 
+    test('a saved raise from the fiddly Position control is reset to the '
+        'low default once, and a raise set after that sticks', () async {
+      // Exactly what an upgrading user has on disk: a raise the old
+      // Position control left behind (Top, 0.2) — the thing that put the
+      // "default" caption ~140px up.
+      await storage.setPlayerSetting('player_sub_raise', 0.2);
+
+      final PlayerSettings settings = await boot().read(
+        playerSettingsProvider.future,
+      );
+      expect(settings.subtitleRaise, 0.0);
+
+      // The reset is one-shot: the flag and the 0 land on disk (the
+      // writes are fire-and-forget from build, so waited for), and the
+      // next launch reads the reset value, not the old one.
+      final deadline = DateTime.now().add(const Duration(seconds: 5));
+      while (storage.getPlayerSetting<bool>('player_sub_raise_v25_reset') !=
+              true &&
+          DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(storage.getPlayerSetting<num>('player_sub_raise'), 0.0);
+      expect(
+        storage.getPlayerSetting<bool>('player_sub_raise_v25_reset'),
+        isTrue,
+      );
+
+      // A raise the viewer sets after the reset sticks across launches.
+      await (await notifierOf(boot())).setSubtitleRaise(0.1);
+      expect(
+        (await boot().read(playerSettingsProvider.future)).subtitleRaise,
+        0.1,
+      );
+    });
+
+    test('a raise saved after the reset is not reset again', () async {
+      await storage.setPlayerSetting('player_sub_raise', 0.1);
+      await storage.setPlayerSetting('player_sub_raise_v25_reset', true);
+
+      final PlayerSettings settings = await boot().read(
+        playerSettingsProvider.future,
+      );
+      expect(settings.subtitleRaise, 0.1);
+    });
+
     test('size is saved on its own, held to 10..80, and survives the next '
         'launch', () async {
       await storage.setPlayerSetting('player_sub_color', 0xFFFFEB3B);

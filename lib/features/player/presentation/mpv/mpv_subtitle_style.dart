@@ -65,11 +65,15 @@ const List<String> kMpvSubtitleEdges = <String>['None', 'Outline', 'Shadow'];
 const double kMpvRaiseNudgeSmall = 0.05;
 const double kMpvRaiseNudgeLarge = 0.1;
 
-/// The bottom padding the caption sits at when the bars are hidden, and when
-/// they are up — the v14 low position, lifted above the controls bar while
-/// the bars are up. The raise is added on top of whichever applies.
-const double kMpvSubtitlePaddingHidden = 40;
-const double kMpvSubtitlePaddingControls = 116;
+/// The bottom padding the caption sits at, in every chrome state — one
+/// fixed value (+25). It used to be 40px with the bars hidden and 116px
+/// with them up, so the caption jumped up whenever the controls or the
+/// lock pill appeared and dropped again when they left; and 40px plus a
+/// saved raise was already ~140px up on a phone in landscape. 16px puts
+/// it close to the bottom edge, the way a normal player does, and the
+/// saved raise still lifts it from there. The PiP window keeps its own
+/// smaller padding below.
+const double kMpvSubtitlePaddingBottom = 16;
 
 /// The PiP window's subtitle scale: Android PiP is a tiny window (about a
 /// third of the screen's width on a phone), and the caption is a Flutter
@@ -158,8 +162,13 @@ List<Shadow>? _mpvSubtitleShadows(PlayerSettings settings) {
 /// above, centred, lifted by the saved raise.
 ///
 /// [screenHeight] is the landscape screen height, the frame the raise is a
-/// share of. The lift is added on top of the base padding, so the caption
-/// never drops under the controls bar.
+/// share of. The lift is added on top of the fixed base padding.
+///
+/// [controlsVisible] no longer moves the caption (+25): the base padding is
+/// the same whether the chrome is up or down, locked or unlocked, so the
+/// caption never jumps when the controls or the lock pill appear. The
+/// parameter stays so call sites keep passing the chrome state and tests
+/// can assert the independence.
 ///
 /// [isPip] is the Android PiP window: the font is halved and the padding
 /// shrunk to PiP proportions (see [kMpvSubtitlePipFontScale]) — the
@@ -186,9 +195,9 @@ SubtitleViewConfiguration mpvSubtitleViewConfiguration(
       ),
     );
   }
-  final base = controlsVisible
-      ? kMpvSubtitlePaddingControls
-      : kMpvSubtitlePaddingHidden;
+  // One fixed base in every state (+25): the caption used to sit at 40px
+  // with the chrome hidden and 116px with it up.
+  const base = kMpvSubtitlePaddingBottom;
   return SubtitleViewConfiguration(
     style: mpvSubtitleTextStyle(settings),
     textAlign: TextAlign.center,

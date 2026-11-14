@@ -1468,11 +1468,19 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     final external = stream.subtitles ?? const [];
     if (external.isNotEmpty) {
       final first = external.first;
-      unawaited(
-        _player.setSubtitleTrack(
-          SubtitleTrack.uri(first.url, title: first.label),
-        ),
-      );
+      // The adapter's `setSubtitleTrack` is idempotent and this selector
+      // is not (+25): a second `sub-add` of the same file would leave a
+      // duplicate of it in mpv's track list, and `state.subtitle` would
+      // carry the line twice. Skip when the file is already current — the
+      // same check the adapter makes.
+      final current = _player.state.track.subtitle;
+      if (!(current.uri == true && current.id == first.url)) {
+        unawaited(
+          _player.setSubtitleTrack(
+            SubtitleTrack.uri(first.url, title: first.label),
+          ),
+        );
+      }
       _subtitleAppliedFor = _streamIndex;
       return;
     }
@@ -1489,7 +1497,12 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
           .toList(growable: false);
       if (real.isNotEmpty) {
         final def = real.indexWhere((t) => t.isDefault == true);
-        unawaited(_player.setSubtitleTrack(real[def >= 0 ? def : 0]));
+        final pick = real[def >= 0 ? def : 0];
+        // As above: skip when the pick is already the current track, so a
+        // re-run of this selector never issues a second set for it.
+        if (_player.state.track.subtitle.id != pick.id) {
+          unawaited(_player.setSubtitleTrack(pick));
+        }
         _subtitleAppliedFor = _streamIndex;
       }
     }
@@ -1796,8 +1809,10 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     };
   }
 
-  /// The chrome showed or hid, so the caption's bottom padding moved
-  /// (40px hidden, 116px up) — push it into the video view.
+  /// The chrome showed or hid. The caption's padding no longer follows it
+  /// (+25: one fixed base in every state), so this is a no-op for the
+  /// padding unless the raise or the PiP state moved with it — the sync
+  /// still runs, and its guard makes it cheap.
   void _onChromeVisibilityChanged() => _syncSubtitlePadding();
 
   /// Pushes the current subtitle padding into the video view.
@@ -1840,8 +1855,16 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
         isPip: _inPip,
       ).padding;
       if (padding == _lastSubtitlePadding) return;
+      // Only record the padding once the view has it: if the video state
+      // is not mounted yet the push is lost, and recording it would make
+      // the guard above treat the caption as moved when it never did —
+      // the caption would sit at its creation padding until a setting
+      // changed. Returning without recording retries it on the next
+      // build or chrome change. (+25)
+      final videoState = _videoKey.currentState;
+      if (videoState == null) return;
       _lastSubtitlePadding = padding;
-      _videoKey.currentState?.setSubtitleViewPadding(padding);
+      videoState.setSubtitleViewPadding(padding);
     } catch (_) {
       // A subtitle-sync failure must never break the player.
     }

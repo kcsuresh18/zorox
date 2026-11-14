@@ -59,7 +59,7 @@ void main() {
       expect(config.padding.bottom, closeTo(22.0, 0.001));
     });
 
-    test('fullscreen is unchanged: 22pt, 16px sides, 40px bottom', () {
+    test('fullscreen is unchanged: 22pt, 16px sides, 16px bottom', () {
       final config = mpvSubtitleViewConfiguration(
         settings,
         screenHeight: 360,
@@ -68,17 +68,24 @@ void main() {
       expect(config.style.fontSize, 22.0);
       expect(config.padding.left, 16.0);
       expect(config.padding.right, 16.0);
-      expect(config.padding.bottom, 40.0);
+      expect(config.padding.bottom, 16.0);
     });
 
-    test('fullscreen with the bars up is unchanged: 116px bottom', () {
-      final config = mpvSubtitleViewConfiguration(
+    test('the bars coming up do not move the caption: 16px bottom either '
+        'way', () {
+      final down = mpvSubtitleViewConfiguration(
+        settings,
+        screenHeight: 360,
+        controlsVisible: false,
+      );
+      final up = mpvSubtitleViewConfiguration(
         settings,
         screenHeight: 360,
         controlsVisible: true,
       );
-      expect(config.style.fontSize, 22.0);
-      expect(config.padding.bottom, 116.0);
+      expect(down.style.fontSize, 22.0);
+      expect(up.padding.bottom, 16.0);
+      expect(up.padding, down.padding);
     });
 
     test('leaving PiP restores the exact fullscreen configuration', () {
@@ -95,7 +102,7 @@ void main() {
       );
       expect(pip.style.fontSize, isNot(full.style.fontSize));
       expect(full.style.fontSize, 22.0);
-      expect(full.padding, const EdgeInsets.fromLTRB(16, 0, 16, 40));
+      expect(full.padding, const EdgeInsets.fromLTRB(16, 0, 16, 16));
     });
 
     test('PiP font never drops below 6pt even for the S step', () {
