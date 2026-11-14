@@ -193,10 +193,10 @@ class GoldenPlayerControls extends ConsumerStatefulWidget {
   final ValueNotifier<bool>? locked;
   final bool lockAvailable;
 
-  /// Enters picture-in-picture. Non-null on Android where PiP exists; the
+  /// Enters picture-in-picture. Non-null where PiP exists; the
   /// button renders only when this is non-null and the `showPip` setting
-  /// is on — the same gate as the stock chrome. Null on iOS (mpv has no
-  /// PiP window there) and on TV.
+  /// is on — the same gate as the stock chrome. Null on TV, and on iOS
+  /// when the mpv PiP setting is off (see the screen's `_pipAvailable`).
   final VoidCallback? onEnterPip;
 
   @override
@@ -1360,7 +1360,7 @@ class _TopBar extends StatelessWidget {
   final VoidCallback onCycleFit;
   final VoidCallback? onRotate;
 
-  /// Non-null when the screen offers PiP (Android) and the `showPip`
+  /// Non-null when the screen offers PiP and the `showPip`
   /// setting is on; the button is absent otherwise.
   final VoidCallback? onEnterPip;
 
@@ -1424,7 +1424,7 @@ class _TopBar extends StatelessWidget {
             tooltip: 'Episodes',
           ),
         if (isSeries) const SizedBox(width: 8),
-        // Picture-in-picture (Android only, `showPip` on): the same
+        // Picture-in-picture (`showPip` on): the same
         // icon and gate as the stock chrome.
         if (onEnterPip != null)
           GoldenIconButton(

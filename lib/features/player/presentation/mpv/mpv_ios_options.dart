@@ -35,6 +35,16 @@ const Map<String, String> kMpvIosOptions = <String, String>{
   'framedrop': 'decoder+vo',
 };
 
+/// The `hwdec` value for the iOS VideoController.
+///
+/// PiP mode (+28) uses `'videotoolbox-copy'`: hardware decode with the
+/// frames copied to system memory, so the software renderer — the only
+/// renderer that can feed a PiP window, because GPU work is not allowed
+/// in the background — can read them. Normal mode keeps `'videotoolbox'`.
+/// Pure, so it is unit-tested (see `mpv_ios_pip_test.dart`).
+String mpvIosHwdec({required bool pipEnabled}) =>
+    pipEnabled ? 'videotoolbox-copy' : 'videotoolbox';
+
 /// Applies [kMpvIosOptions] to a player's mpv instance, then reads the
 /// fallback back so the log shows what was set. Same best-effort shape
 /// as [applyMpvAndroidOptions] in `mpv_android_options.dart`: a single

@@ -77,9 +77,9 @@ class PlayerSettingsScreen extends ConsumerWidget {
                     ),
                   ),
                   // Player Engine (libmpv / libVLC): which engine plays the
-                  // next video. libmpv is the Golden player (PiP on Android
-                  // only); libVLC is the only engine that can do PiP on
-                  // iOS. Takes effect on the next play.
+                  // next video. libmpv is the Golden player; libVLC is the
+                  // only engine that could do PiP on iOS before +28. Takes
+                  // effect on the next play.
                   SettingsTile(
                     icon: Icons.memory_rounded,
                     title: l10n.playerEngine,
@@ -95,6 +95,31 @@ class PlayerSettingsScreen extends ConsumerWidget {
                       playerSettings.playerEngine,
                     ),
                   ),
+                  // iOS Picture-in-Picture on the mpv engine (+28), iOS
+                  // only: Android mpv PiP already works on the hardware
+                  // renderer. On, the player runs the software renderer
+                  // (PiP needs it — GPU work is not allowed in the
+                  // background), so the picture is softer and 4K is
+                  // heavier. Takes effect on the next play, like the
+                  // engine choice. Title is a plain English literal, the
+                  // same as 'Auto Skip' below.
+                  if (platform == TargetPlatform.iOS)
+                    SettingsTile(
+                      icon: Icons.picture_in_picture_alt_rounded,
+                      title: 'Picture-in-Picture (mpv)',
+                      subtitle: playerSettings.iosMpvPip
+                          ? 'On · software renderer'
+                          : l10n.disabled,
+                      trailing: Switch(
+                        value: playerSettings.iosMpvPip,
+                        onChanged: (val) => ref
+                            .read(playerSettingsProvider.notifier)
+                            .setIosMpvPip(val),
+                      ),
+                      onTap: () => ref
+                          .read(playerSettingsProvider.notifier)
+                          .setIosMpvPip(!playerSettings.iosMpvPip),
+                    ),
                   if (isTouchDevice) ...[
                     SettingsTile(
                       icon: Icons.swipe_vertical_rounded,

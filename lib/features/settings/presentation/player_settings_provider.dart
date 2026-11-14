@@ -97,14 +97,15 @@ const List<double> kSubtitleTextOpacities = <double>[1, 0.75, 0.5, 0.25];
 ///
 /// libmpv (media_kit, the Golden player) is the default: it is the engine
 /// the Golden UI was built on, and the one every +14 fix targets. libVLC
-/// is the v16/v17 engine: it is the only one that can do Picture-in-Picture
-/// on iOS (mpv renders through Metal with no AVPlayerLayer), and its
-/// buffering is its own network cache + prefetch ring (see media_options).
+/// is the v16/v17 engine. iOS Picture-in-Picture works on both now: libVLC
+/// natively, and libmpv through the +28 software-renderer bridge (see
+/// [PlayerSettings.iosMpvPip]) — before +28 only libVLC could do it.
 /// The choice takes effect on the NEXT play — the route reads it once when
 /// the player opens, so a change mid-play never swaps the engine under a
 /// running video.
 enum PlayerEngine {
-  /// libmpv via media_kit — the Golden player. PiP on Android only.
+  /// libmpv via media_kit — the Golden player. PiP on Android, and on
+  /// iOS when the +28 setting is on (software renderer).
   mpv,
 
   /// libVLC — the v16/v17 engine. PiP on Android and iOS.
@@ -242,6 +243,19 @@ class PlayerSettings {
   /// the player opens — see [PlayerEngine].
   final PlayerEngine playerEngine;
 
+  /// iOS Picture-in-Picture on the mpv engine (+28).
+  ///
+  /// Off by default: PiP on iOS needs the software renderer — GPU work is
+  /// not allowed while the app is backgrounded — so turning this on runs
+  /// the player with `enableHardwareAcceleration: false` plus
+  /// `hwdec: videotoolbox-copy` (hardware decode, software render). The
+  /// picture loses the shaders, HDR looks washed out, and 4K is heavy.
+  /// Takes effect on the NEXT play, like the engine choice: the
+  /// VideoController is created once when the player opens. On Android
+  /// this does nothing — Android mpv PiP already works on the hardware
+  /// renderer.
+  final bool iosMpvPip;
+
   // Subtitle Accounts
   final String osUsername;
   final String osPassword;
@@ -288,6 +302,7 @@ class PlayerSettings {
     this.showEpisodes = true,
     this.autoSkip = true,
     this.playerEngine = PlayerEngine.mpv,
+    this.iosMpvPip = false,
     this.osUsername = '',
     this.osPassword = '',
     this.osApiKey = '',
@@ -336,6 +351,7 @@ class PlayerSettings {
     bool? showEpisodes,
     bool? autoSkip,
     PlayerEngine? playerEngine,
+    bool? iosMpvPip,
     String? osUsername,
     String? osPassword,
     String? osApiKey,
@@ -388,6 +404,7 @@ class PlayerSettings {
       showEpisodes: showEpisodes ?? this.showEpisodes,
       autoSkip: autoSkip ?? this.autoSkip,
       playerEngine: playerEngine ?? this.playerEngine,
+      iosMpvPip: iosMpvPip ?? this.iosMpvPip,
       osUsername: osUsername ?? this.osUsername,
       osPassword: osPassword ?? this.osPassword,
       osApiKey: osApiKey ?? this.osApiKey,
@@ -634,6 +651,14 @@ class PlayerSettingsNotifier extends _$PlayerSettingsNotifier {
       (e) => e.name == storage.getPlayerSetting<String>('player_engine'),
       orElse: () => PlayerEngine.mpv,
     );
+    // iOS mpv PiP (+28): off unless the viewer turned it on. Absent on a
+    // fresh install or an upgrade from before this setting.
+    final iosMpvPip =
+        storage.getPlayerSetting<bool>(
+          'player_ios_mpv_pip',
+          defaultValue: false,
+        ) ??
+        false;
 
     // No defaultValue: an absent key has to stay absent, because null is what
     // Auto is stored as. The old key, player_network_buffer_mb, is never read.
@@ -683,6 +708,7 @@ class PlayerSettingsNotifier extends _$PlayerSettingsNotifier {
       showEpisodes: showEpisodes,
       autoSkip: autoSkip,
       playerEngine: playerEngine,
+      iosMpvPip: iosMpvPip,
       osUsername: osUser,
       osApiKey: osKey,
       subdlEmail: dlEmail,
@@ -863,6 +889,13 @@ class PlayerSettingsNotifier extends _$PlayerSettingsNotifier {
   Future<void> setPlayerEngine(PlayerEngine engine) async {
     await _repository.setPlayerSetting('player_engine', engine.name);
     _update((PlayerSettings c) => c.copyWith(playerEngine: engine));
+  }
+
+  /// iOS Picture-in-Picture on the mpv engine (+28). Takes effect on the
+  /// next play: the VideoController is created once when the player opens.
+  Future<void> setIosMpvPip(bool value) async {
+    await _repository.setPlayerSetting('player_ios_mpv_pip', value);
+    _update((PlayerSettings c) => c.copyWith(iosMpvPip: value));
   }
 
   Future<void> setSubtitleSettings(

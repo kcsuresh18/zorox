@@ -34,9 +34,14 @@
 ///     of the first working source.
 ///
 /// What it deliberately does NOT carry (mpv limits, reported honestly):
-///   * PiP on iOS — mpv renders through a Metal texture, not an
-///     AVPlayerLayer (see the v18 header), so there is no iOS PiP window.
-///     Android PiP exists: the activity enters it through
+///   * PiP on iOS — before +28 there was none: mpv renders through a
+///     texture, not an AVPlayerLayer, so there is no iOS PiP window.
+///     +28 adds it behind the "Picture-in-Picture (mpv)" setting in
+///     Settings → Player, off by default: the player then runs the
+///     software renderer (GPU work is not allowed in the background)
+///     and a native plugin taps the rendered frames into a
+///     sample-buffer PiP window (see `packages/zorox_mpv_pip`). Android
+///     PiP exists as before: the activity enters it through
 ///     [PlayerPlatformService] — a button in the top bar, plus auto-enter
 ///     when the viewer leaves the app mid-play — and the chrome unmounts
 ///     while the window is open. Audio keeps playing in the background
@@ -59,6 +64,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:vlc_player/vlc_player.dart';
+import 'package:zorox_mpv_pip/zorox_mpv_pip.dart';
 
 import '../../../../core/domain/entity/multimedia_item.dart';
 import '../../../../core/providers/device_info_provider.dart';
@@ -443,6 +449,30 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   bool _pipWindowOpened = false;
   bool _pipAttemptFromButton = false;
 
+  /// iOS mpv PiP (+28): the native bridge, created in [_init] only when
+  /// the viewer turned the setting on — the player then runs the software
+  /// renderer, which is what makes the frames available to tap. Null on
+  /// Android and when the setting is off.
+  MpvPipIos? _iosPip;
+
+  /// Whether this player opened with the iOS mpv PiP setting on. Read
+  /// once in [_init], like the engine choice: a change mid-play takes
+  /// effect on the next play, because the VideoController — hardware or
+  /// software renderer — is created once when the player opens.
+  bool _iosMpvPipEnabled = false;
+
+  /// Whether the native plugin reports sample-buffer PiP as supported on
+  /// this device. Resolved in [_init]; false everywhere the bridge does
+  /// not exist, so the button never renders there.
+  bool _iosPipSupported = false;
+
+  /// mpv's `sub-visibility` as it was before PiP started, so the burn-in
+  /// the PiP window needs can be undone exactly when PiP stops. Null
+  /// while PiP is not up. Normally `no` (media_kit sets it from
+  /// `PlayerConfiguration.libass`, false here) — remembered rather than
+  /// assumed, so a build that changes the default still restores right.
+  String? _subVisibilityBeforePip;
+
   bool get _isSeries =>
       widget.item.contentType == MultimediaContentType.series ||
       widget.item.contentType == MultimediaContentType.anime;
@@ -451,14 +481,21 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
 
   bool get _canSeek => _duration > Duration.zero && !_isLive;
 
-  /// Picture-in-picture is an Android activity mode; mpv on iOS renders
-  /// through a Metal texture with no AVPlayerLayer, so there is no PiP
-  /// there. Meaningless on a television either way.
+  /// Picture-in-picture: Android always (an activity mode), iOS only
+  /// when the viewer turned the +28 setting on — PiP on iOS needs the
+  /// software renderer, so the player must have opened in that mode —
+  /// and the native plugin reports support. Meaningless on a television
+  /// either way.
   ///
   /// The gate reads [defaultTargetPlatform] rather than `Platform.isAndroid`
   /// because only the former can be overridden by a test (see
   /// [PlayerPlatformService.enterPip]); in production the two agree.
   bool get _pipAvailable {
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      if (!_iosMpvPipEnabled || !_iosPipSupported) return false;
+      final profile = ref.read(deviceProfileProvider).asData?.value;
+      return playerFormFactorOf(profile) != PlayerFormFactor.tv;
+    }
     if (defaultTargetPlatform != TargetPlatform.android) return false;
     final profile = ref.read(deviceProfileProvider).asData?.value;
     return playerFormFactorOf(profile) != PlayerFormFactor.tv;
@@ -528,6 +565,12 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     // The channel handler closes over this screen; without the detach it
     // would keep routing PiP buttons into a disposed player.
     _platform.detachPipListener();
+    // iOS mpv PiP (+28): release the native session and put mpv's
+    // subtitle rendering back the way it was, while the player still
+    // exists to answer the property write.
+    unawaited(_restoreMpvSubtitlesAfterPip());
+    unawaited(_iosPip?.dispose());
+    _iosPip = null;
     for (final sub in _subs) {
       unawaited(sub.cancel());
     }
@@ -568,15 +611,29 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (_disposed || !mounted) return;
     if (state == AppLifecycleState.inactive) {
-      // Home swipe / app switcher on Android: the moment to enter PiP.
-      // `inactive` is the activity pausing while still visible, so the
-      // enter call is still valid here — and the window opening keeps
-      // the app from ever reaching `paused`, so media_kit's
-      // pauseUponEnteringBackgroundMode never fires and the film keeps
-      // playing under the window. Only while actually playing, and only
-      // where PiP exists; a paused film stays paused.
-      if (!_inPip && _pipAvailable && _playing) {
-        unawaited(_enterPip());
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        // iOS: do NOT start PiP here. `inactive` fires for a transient
+        // overlay too — Control Center, Notification Center, a call — and
+        // starting PiP for one of those would open a window that never
+        // should have existed. Leaving the app for real (Home, the app
+        // switcher) is handled natively instead: the bridge arms
+        // `canStartPictureInPictureAutomaticallyFromInline` while the film
+        // is playing (see [_syncIosPipState]), and iOS opens the window
+        // when the app backgrounds. A transient inactive never
+        // backgrounds the app, so the window never opens for Control
+        // Center. The window opening is reported through `pipStarted`,
+        // which is what sets [_inPip].
+      } else {
+        // Home swipe / app switcher on Android: the moment to enter PiP.
+        // `inactive` is the activity pausing while still visible, so the
+        // enter call is still valid here — and the window opening keeps
+        // the app from ever reaching `paused`, so media_kit's
+        // pauseUponEnteringBackgroundMode never fires and the film keeps
+        // playing under the window. Only while actually playing, and only
+        // where PiP exists; a paused film stays paused.
+        if (!_inPip && _pipAvailable && _playing) {
+          unawaited(_enterPip());
+        }
       }
     }
     if (state == AppLifecycleState.resumed) {
@@ -702,6 +759,13 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// never sends `pipModeChanged`; without the reset below the optimism
   /// is permanent and the chrome never comes back.
   Future<void> _enterPip({bool fromButton = false}) async {
+    // iOS mpv PiP (+28) rides the native bridge, not the Android
+    // activity call: the window is a sample-buffer PiP window, and the
+    // answer arrives through `pipStarted` / `pipFailed`.
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      await _enterIosMpvPip(fromButton: fromButton);
+      return;
+    }
     _pipAttemptFromButton = fromButton;
     _pipWindowOpened = false;
     setState(() => _inPip = true);
@@ -732,6 +796,162 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     // reported through `pipModeChanged`. If neither arrives, the watchdog
     // takes the chrome back (see [_armPipWatchdog]).
     _armPipWatchdog();
+  }
+
+  /// Enters the iOS mpv PiP window through the native bridge.
+  ///
+  /// Mirrors the Android path above: the chrome comes off optimistically
+  /// in the same frame the request is made, and the lock clears on the
+  /// way in (a locked PiP window has no chip in it). The window opening
+  /// is reported through `pipStarted` (see [_setupIosMpvPip]); a refusal
+  /// arrives through `pipFailed` or, if neither arrives, the watchdog
+  /// takes the chrome back.
+  Future<void> _enterIosMpvPip({required bool fromButton}) async {
+    final pip = _iosPip;
+    if (pip == null) return;
+    _pipAttemptFromButton = fromButton;
+    _pipWindowOpened = false;
+    setState(() => _inPip = true);
+    _locked.value = false;
+    final entered = await pip.enterPiP();
+    if (_disposed || !mounted || !_inPip) return;
+    if (!entered) {
+      if (fromButton) {
+        ref
+            .read(notificationServiceProvider)
+            .showInfo(
+              'Picture-in-picture isn\'t available for this video right now.',
+              title: 'Picture-in-picture',
+            );
+      }
+      setState(() => _inPip = false);
+      return;
+    }
+    _armPipWatchdog();
+  }
+
+  /// Creates the iOS mpv PiP bridge (+28) and wires the native callbacks.
+  ///
+  /// Runs in [_init] when the viewer turned the setting on. The native
+  /// layer is created once, up front, so the button and auto-PiP both
+  /// have a source ready; frames are throttled to ~5 fps until the
+  /// window actually opens. `isSupported` is checked first: a device
+  /// without PiP leaves the bridge null and the button hidden. The
+  /// trailing setState rebuilds once support is known, so the button
+  /// appears on the first play rather than the next rebuild.
+  Future<void> _setupIosMpvPip() async {
+    if (defaultTargetPlatform != TargetPlatform.iOS ||
+        !_iosMpvPipEnabled) {
+      return;
+    }
+    if (!await MpvPipIos.isSupported) return;
+    final pip = MpvPipIos();
+    pip.onPipStarted = () {
+      if (!mounted || _disposed) return;
+      // The window opened — for the button path this confirms the
+      // optimistic chrome-off; for auto-PiP (native, on Home swipe)
+      // this is the first the screen hears of it, so the chrome comes
+      // off here.
+      _pipWindowOpened = true;
+      _pipWatchdog?.cancel();
+      _pipWatchdog = null;
+      unawaited(_enableMpvSubtitlesForPip());
+      if (!_inPip) setState(() => _inPip = true);
+    };
+    pip.onPipStopped = (restored) {
+      if (!mounted || _disposed) return;
+      unawaited(_restoreMpvSubtitlesAfterPip());
+      _pipWatchdog?.cancel();
+      _pipWatchdog = null;
+      if (_inPip) setState(() => _inPip = false);
+    };
+    pip.onPipFailed = (reason) {
+      if (kDebugMode) {
+        debugPrint('MpvPlayerScreen: iOS PiP failed: $reason');
+      }
+      if (_disposed || !mounted || !_inPip || _pipWindowOpened) return;
+      _pipWatchdog?.cancel();
+      _pipWatchdog = null;
+      if (_pipAttemptFromButton) {
+        ref
+            .read(notificationServiceProvider)
+            .showInfo(
+              'Picture-in-picture didn\'t open for this video.',
+              title: 'Picture-in-picture',
+            );
+      }
+      setState(() => _inPip = false);
+    };
+    pip.onPipSetPlaying = (playing) {
+      if (_disposed) return;
+      unawaited(playing ? _player.play() : _player.pause());
+    };
+    pip.onPipSkip = (seconds) {
+      if (_disposed) return;
+      _seekRelative(Duration(seconds: seconds));
+    };
+    _iosPip = pip;
+    _iosPipSupported = true;
+    await pip.prepare(
+      position: _position,
+      duration: _duration,
+      playing: _playing,
+    );
+    if (mounted && !_disposed) setState(() {});
+  }
+
+  /// Syncs playback state into the iOS PiP bridge: the scrubber, the
+  /// play/pause state, and the auto-PiP arm (on only while playing).
+  ///
+  /// Called from the playing/duration listeners on every change and from
+  /// the position listener on the same 200 ms throttle as the UI rebuild,
+  /// so the channel sees at most ~5 syncs a second. No-op when the bridge
+  /// does not exist.
+  void _syncIosPipState() {
+    final pip = _iosPip;
+    if (pip == null || !pip.isPrepared) return;
+    unawaited(
+      pip.updateState(
+        position: _position,
+        duration: _duration,
+        playing: _playing,
+      ),
+    );
+  }
+
+  /// Turns mpv's own subtitle rendering on for the PiP window, so the
+  /// caption burns into the frame the plugin taps.
+  ///
+  /// Only while PiP is up: normal playback shows subtitles through the
+  /// Flutter overlay, and `sub-visibility: yes` would show them twice.
+  /// The previous value is remembered (see [_subVisibilityBeforePip]) so
+  /// the restore is exact. Best-effort: a failure leaves the PiP window
+  /// without subtitles, not without video.
+  Future<void> _enableMpvSubtitlesForPip() async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return;
+    try {
+      _subVisibilityBeforePip ??= await platform.getProperty(
+        'sub-visibility',
+      );
+      await platform.setProperty('sub-visibility', 'yes');
+    } catch (_) {
+      // Best-effort: PiP video still works without burned-in subtitles.
+    }
+  }
+
+  /// Puts mpv's subtitle rendering back the way it was before PiP.
+  Future<void> _restoreMpvSubtitlesAfterPip() async {
+    final before = _subVisibilityBeforePip;
+    _subVisibilityBeforePip = null;
+    if (before == null) return;
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return;
+    try {
+      await platform.setProperty('sub-visibility', before);
+    } catch (_) {
+      // Best-effort: the overlay is the subtitle display anyway.
+    }
   }
 
   /// Arms the PiP watchdog for the attempt that just went out.
@@ -791,6 +1011,32 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
         bufferSize: kMpvBufferSize,
       ),
     );
+
+    // The panel's copy of the settings, kept live from the provider.
+    // Read before the VideoController: the iOS mpv PiP setting decides
+    // which renderer the controller creates (see below).
+    final settings =
+        ref.read(playerSettingsProvider).asData?.value ??
+        const PlayerSettings();
+    _playerSettings = ValueNotifier<PlayerSettings>(settings);
+    ref.listenManual<AsyncValue<PlayerSettings>>(
+      playerSettingsProvider,
+      (_, next) {
+        final value = next.asData?.value;
+        if (value != null && !_disposed) _playerSettings.value = value;
+      },
+    );
+
+    // iOS mpv PiP (+28): when the viewer turned it on, the player runs
+    // the software renderer — GPU work is not allowed while the app is
+    // backgrounded, and PiP runs while backgrounded — with
+    // `hwdec: videotoolbox-copy` (hardware decode, software render) so
+    // the forked media_kit_video tap can feed the PiP window. Off by
+    // default: the software renderer loses the shaders, HDR looks washed
+    // out, and 4K is heavy. Takes effect on the next play, like the
+    // engine choice.
+    _iosMpvPipEnabled =
+        defaultTargetPlatform == TargetPlatform.iOS && settings.iosMpvPip;
     try {
       _videoController = VideoController(
         _player,
@@ -800,8 +1046,12 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
           // 4K HEVC in software is the stutter the viewer reported on
           // Android (iOS is smooth because VideoToolbox engages there).
           // Android uses media_kit's default 'auto-safe' (mediacodec).
-          hwdec: mpvHwdecForPlatform(defaultTargetPlatform),
-          enableHardwareAcceleration: true,
+          // iOS picks its decoder through [mpvIosHwdec]: PiP mode uses
+          // 'videotoolbox-copy' (see above).
+          hwdec: defaultTargetPlatform == TargetPlatform.iOS
+              ? mpvIosHwdec(pipEnabled: _iosMpvPipEnabled)
+              : mpvHwdecForPlatform(defaultTargetPlatform),
+          enableHardwareAcceleration: !_iosMpvPipEnabled,
         ),
       );
     } catch (e) {
@@ -818,19 +1068,6 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       player: _player,
       externalSubtitles: () => _selected?.subtitles ?? const [],
       mediaTitle: () => widget.item.title,
-    );
-
-    // The panel's copy of the settings, kept live from the provider.
-    final settings =
-        ref.read(playerSettingsProvider).asData?.value ??
-        const PlayerSettings();
-    _playerSettings = ValueNotifier<PlayerSettings>(settings);
-    ref.listenManual<AsyncValue<PlayerSettings>>(
-      playerSettingsProvider,
-      (_, next) {
-        final value = next.asData?.value;
-        if (value != null && !_disposed) _playerSettings.value = value;
-      },
     );
 
     _listen();
@@ -888,6 +1125,9 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
         (_) => unawaited(_onThermalTick()),
       );
     }
+    // iOS mpv PiP bridge (+28): created once, up front, so the button and
+    // auto-PiP both have a source ready when playback starts.
+    await _setupIosMpvPip();
     await _resolveAndOpen();
   }
 
@@ -906,6 +1146,10 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
           playing,
           videoSize: _adapter.value.videoSize,
         );
+        // iOS mpv PiP (+28): the same sync for the native bridge — the
+        // scrubber, the play/pause state, and the auto-PiP arm, which is
+        // on only while playing.
+        _syncIosPipState();
         if (playing) {
           final firstPlay = !_startedPlaying;
           _startedPlaying = true;
@@ -977,6 +1221,10 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
         if (now.difference(_lastPositionUi) >=
             const Duration(milliseconds: 200)) {
           _lastPositionUi = now;
+          // iOS mpv PiP (+28): same throttle for the bridge sync, so the
+          // native scrubber follows the playhead without a channel call
+          // on every position tick.
+          _syncIosPipState();
           setState(() {});
         }
       }),
@@ -985,6 +1233,7 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       _player.stream.duration.listen((duration) {
         if (_disposed) return;
         _duration = duration;
+        _syncIosPipState();
         _publishAdapter();
         setState(() {});
       }),
@@ -2039,7 +2288,13 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
                   // The stock controls below; media_kit's own are hidden.
                   controls: (_) => const SizedBox.shrink(),
                   wakelock: true,
-                  pauseUponEnteringBackgroundMode: true,
+                  // iOS mpv PiP (+28): when the player runs the software
+                  // renderer for PiP, the film must NOT pause when the app
+                  // backgrounds — the PiP window IS the background
+                  // playback, and a pause here would freeze it on the
+                  // first frame. Off by default: without PiP the
+                  // background pause is today's behaviour.
+                  pauseUponEnteringBackgroundMode: !_iosMpvPipEnabled,
                   subtitleViewConfiguration: subtitleConfig,
                 ),
               ),
