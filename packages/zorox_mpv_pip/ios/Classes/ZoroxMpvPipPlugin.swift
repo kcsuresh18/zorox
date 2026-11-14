@@ -476,10 +476,6 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     )
   }
 
-  // didTransitionToRenderSize is intentionally omitted: CMVideoSize is
-  // not in scope for Swift in this SDK, and the method would be a no-op
-  // anyway — aspect is preserved by the layer's .resizeAspect gravity.
-
   public func pictureInPictureControllerIsPlaybackPaused(
     _ controller: AVPictureInPictureController
   ) -> Bool {
@@ -531,5 +527,18 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       arguments: Int(time.seconds - lastPosition)
     )
     completionHandler(true)
+  }
+
+  // Required by AVPictureInPictureSampleBufferPlaybackDelegate (the
+  // fifth of its five callbacks). The parameter type is CMVideoDimensions
+  // in this SDK — the earlier CMVideoSize spelling is not in scope for
+  // Swift here, which is why the method was briefly deleted; deleting it
+  // broke conformance (build 6af8e5c9: "does not conform to protocol
+  // 'AVPictureInPictureSampleBufferPlaybackDelegate'"). The body is a
+  // no-op — aspect is preserved by the layer's .resizeAspect gravity.
+  public func pictureInPictureController(
+    _ controller: AVPictureInPictureController,
+    didTransitionToRenderSize newRenderSize: CMVideoDimensions
+  ) {
   }
 }
