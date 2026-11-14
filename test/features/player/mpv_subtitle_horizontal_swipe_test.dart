@@ -242,6 +242,14 @@ void main() {
 
     testWidgets('the drawer shows Position but no −10/−5/+5/+10',
         (tester) async {
+      // A tall viewport: the drawer is full-height and its ListView
+      // builds every row without scrolling. The old
+      // `scrollUntilVisible` hung here — the row never settled into
+      // view — so no test scrolls this drawer anymore.
+      tester.view.physicalSize = const Size(800, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
       final settings = ValueNotifier<PlayerSettings>(
         const PlayerSettings(),
       );
@@ -260,12 +268,6 @@ void main() {
           ),
         ),
       );
-      await tester.pump();
-
-      // The drawer is a ListView and the Position row sits below the
-      // fold in the test viewport, so it is not built until scrolled
-      // into view.
-      await tester.scrollUntilVisible(find.text('Position'), 200);
       await tester.pump();
 
       expect(find.text('Position'), findsOneWidget);

@@ -9,8 +9,9 @@
 /// open; here they do not.)
 ///
 /// Rows (mockup order): track, text size, text colour, font, bold,
-/// background, outline, position (+ offset pills), text opacity, encoding,
-/// reset. The gold accent is the active/selected state throughout.
+/// background, outline, position, auto-adjust, manual slider, text
+/// opacity, encoding, reset. The gold accent is the active/selected state
+/// throughout.
 library;
 
 import 'dart:async';
@@ -292,6 +293,26 @@ class _GoldenSubtitleStyleDrawerState
                 onPosition: (raise) =>
                     widget.notifier.setSubtitleRaise(raise),
               ),
+              _ToggleRow(
+                key: const ValueKey('subtitle-auto-adjust'),
+                icon: Icons.auto_awesome_rounded,
+                label: 'Auto-Adjust',
+                value: settings.subtitleAutoAdjust,
+                onChanged: (auto) =>
+                    widget.notifier.setSubtitleAutoAdjust(auto),
+              ),
+              // Hidden while Auto-Adjust is on (+27): the automatic
+              // position owns the caption then, and a slider that does
+              // nothing would lie. The reference app greys it out; this
+              // drawer hides the row entirely, so the list never shows a
+              // dead control.
+              if (!settings.subtitleAutoAdjust)
+                _SliderRow(
+                  key: const ValueKey('subtitle-manual-slider'),
+                  settings: settings,
+                  onRaise: (raise) =>
+                      widget.notifier.setSubtitleRaise(raise),
+                ),
               _StepperRow(
                 icon: Icons.opacity_rounded,
                 label: 'Text opacity',
@@ -793,6 +814,7 @@ class _DropdownRow<T> extends StatelessWidget {
 /// A label + gold switch row.
 class _ToggleRow extends StatelessWidget {
   const _ToggleRow({
+    super.key,
     required this.icon,
     required this.label,
     required this.value,
@@ -842,10 +864,10 @@ class _ToggleRow extends StatelessWidget {
 ///
 /// The stock model is a lift in [0, 0.2] of the picture's height, so the
 /// three positions are the ends and the middle of that range (0 / 0.1 /
-/// 0.2). Fine adjustment is the swipe on the video, not buttons: a
-/// horizontal swipe lifts the caption to the right and drops it to the
-/// left, and the centre-third vertical slide does the same up and down
-/// (+25/+26) — the fiddly −10/−5/+5/+10 pills are gone.
+/// 0.2). Fine adjustment is the Manual slider below and the swipe on the
+/// video, not buttons: a horizontal swipe lifts the caption to the right
+/// and drops it to the left, and the centre-third vertical slide does the
+/// same up and down (+25/+26) — the fiddly −10/−5/+5/+10 pills are gone.
 class _PositionRow extends StatelessWidget {
   const _PositionRow({
     required this.settings,
@@ -966,6 +988,109 @@ class _PositionRow extends StatelessWidget {
                 ],
               ),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The Manual slider's 0–100% for a raise in [0, 0.2]: 0% is the bottom
+/// edge, 100% the top of the range. Pure, so it is unit-tested.
+double subtitleRaiseToSliderPercent(double raise) =>
+    raise.clamp(0.0, kSubtitleRaises.last) / kSubtitleRaises.last * 100;
+
+/// The raise a Manual slider percent means: the inverse of
+/// [subtitleRaiseToSliderPercent]. Held to the range, so a drag past
+/// either end lands on the end.
+double subtitleRaiseFromSliderPercent(double percent) =>
+    percent.clamp(0.0, 100.0) / 100 * kSubtitleRaises.last;
+
+/// Manual: a slider for the fine position, 0–100% of the raise range
+/// [0, 0.2] (+27). Dragging moves the caption live — the slider writes
+/// through `setSubtitleRaise`, which is also what the swipes write, so
+/// the caption, the Position dropdown and the slider can never disagree.
+/// Hidden while Auto-Adjust is on: the automatic position owns the
+/// caption then, and a slider that does nothing would lie. The reset
+/// button puts the caption back at the bottom edge.
+class _SliderRow extends StatelessWidget {
+  const _SliderRow({
+    super.key,
+    required this.settings,
+    required this.onRaise,
+  });
+
+  final PlayerSettings settings;
+  final ValueChanged<double> onRaise;
+
+  @override
+  Widget build(BuildContext context) {
+    final percent = subtitleRaiseToSliderPercent(settings.subtitleRaise);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Row(
+        children: <Widget>[
+          const Icon(
+            Icons.height_rounded,
+            size: 20,
+            color: GoldenPlayerColors.gold,
+          ),
+          const SizedBox(width: 12),
+          const Text(
+            'Manual',
+            style: TextStyle(
+              color: GoldenPlayerColors.textPrimary,
+              fontWeight: FontWeight.w600,
+              fontSize: 14,
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                activeTrackColor: GoldenPlayerColors.goldHighlight,
+                inactiveTrackColor: GoldenPlayerColors.divider,
+                thumbColor: GoldenPlayerColors.goldHighlight,
+                overlayColor: GoldenPlayerColors.gold.withValues(
+                  alpha: 0.2,
+                ),
+                thumbShape: const RoundSliderThumbShape(
+                  enabledThumbRadius: 7,
+                ),
+                overlayShape: const RoundSliderOverlayShape(
+                  overlayRadius: 14,
+                ),
+                trackHeight: 4,
+              ),
+              child: Slider(
+                value: percent,
+                min: 0,
+                max: 100,
+                onChanged: (value) =>
+                    onRaise(subtitleRaiseFromSliderPercent(value)),
+              ),
+            ),
+          ),
+          const SizedBox(width: 4),
+          SizedBox(
+            width: 36,
+            child: Text(
+              '${percent.round()}%',
+              textAlign: TextAlign.right,
+              style: const TextStyle(
+                color: GoldenPlayerColors.textSecondary,
+                fontWeight: FontWeight.w600,
+                fontSize: 13,
+              ),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.restart_alt_rounded, size: 20),
+            color: GoldenPlayerColors.textSecondary,
+            tooltip: 'Back to the bottom edge',
+            onPressed: settings.subtitleRaise > 0
+                ? () => onRaise(0.0)
+                : null,
           ),
         ],
       ),

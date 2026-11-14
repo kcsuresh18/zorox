@@ -196,21 +196,28 @@ import UserNotifications
       binaryMessenger: engineBridge.applicationRegistrar.messenger()
     )
     memoryChannel.setMethodCallHandler { call, result in
-      guard call.method == "read" else {
+      switch call.method {
+      case "read":
+        var reading: [String: Any] = [
+          "totalMb": Int(ProcessInfo.processInfo.physicalMemory / 1_048_576),
+          "lowRam": false,
+        ]
+        // What this app may still allocate before iOS ends it: what a buffer
+        // competes for. The simulator has no such limit and reports 0.
+        let available = os_proc_available_memory()
+        if available > 0 {
+          reading["freeMb"] = Int(available / 1_048_576)
+        }
+        result(reading)
+      case "thermalState":
+        // How hot the phone is running (lib/core/providers/thermal_state.dart):
+        // 0 nominal, 1 fair, 2 serious, 3 critical. The player reads it
+        // while a film plays so a hot phone can drop 4K for 1080p before
+        // the OS throttles the decode (see mpv_thermal_quality.dart).
+        result(ProcessInfo.processInfo.thermalState.rawValue)
+      default:
         result(FlutterMethodNotImplemented)
-        return
       }
-      var reading: [String: Any] = [
-        "totalMb": Int(ProcessInfo.processInfo.physicalMemory / 1_048_576),
-        "lowRam": false,
-      ]
-      // What this app may still allocate before iOS ends it: what a buffer
-      // competes for. The simulator has no such limit and reports 0.
-      let available = os_proc_available_memory()
-      if available > 0 {
-        reading["freeMb"] = Int(available / 1_048_576)
-      }
-      result(reading)
     }
   }
 

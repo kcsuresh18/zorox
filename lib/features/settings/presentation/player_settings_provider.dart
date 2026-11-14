@@ -137,6 +137,13 @@ class PlayerSettings {
   /// height: one of [kSubtitleRaises].
   final double subtitleRaise;
 
+  /// Whether the caption positions itself (+27): when on, the saved
+  /// [subtitleRaise] is ignored — the caption sits just above the bottom
+  /// controls while they are visible, low when they are hidden — and the
+  /// Manual slider in the Style tab is hidden. Off by default, so every
+  /// existing install keeps its manual position.
+  final bool subtitleAutoAdjust;
+
   /// Whether the letters are bold.
   ///
   /// This, [subtitleFont], [subtitleTextOpacity] and [subtitleEncoding] reach
@@ -258,6 +265,7 @@ class PlayerSettings {
     this.subtitleOutline = SubtitleOutline.thin,
     this.subtitleShadow = false,
     this.subtitleRaise = 0.0,
+    this.subtitleAutoAdjust = false,
     this.subtitleBold = false,
     this.subtitleFont = SubtitleFont.standard,
     this.subtitleTextOpacity = 1.0,
@@ -303,6 +311,7 @@ class PlayerSettings {
     SubtitleOutline? subtitleOutline,
     bool? subtitleShadow,
     double? subtitleRaise,
+    bool? subtitleAutoAdjust,
     bool? subtitleBold,
     SubtitleFont? subtitleFont,
     double? subtitleTextOpacity,
@@ -351,6 +360,7 @@ class PlayerSettings {
       subtitleOutline: subtitleOutline ?? this.subtitleOutline,
       subtitleShadow: subtitleShadow ?? this.subtitleShadow,
       subtitleRaise: subtitleRaise ?? this.subtitleRaise,
+      subtitleAutoAdjust: subtitleAutoAdjust ?? this.subtitleAutoAdjust,
       subtitleBold: subtitleBold ?? this.subtitleBold,
       subtitleFont: subtitleFont ?? this.subtitleFont,
       subtitleTextOpacity: subtitleTextOpacity ?? this.subtitleTextOpacity,
@@ -502,6 +512,14 @@ class PlayerSettingsNotifier extends _$PlayerSettingsNotifier {
         storage.setPlayerSetting('player_sub_raise_v25_reset', true),
       );
     }
+    // Auto-Adjust (+27): off unless the viewer turned it on. Absent on a
+    // fresh install or an upgrade from before this setting.
+    final subAutoAdjust =
+        storage.getPlayerSetting<bool>(
+              'player_sub_auto_adjust',
+              defaultValue: false,
+            ) ??
+            false;
     final subBold =
         storage.getPlayerSetting<bool>(
           'player_sub_bold',
@@ -642,6 +660,7 @@ class PlayerSettingsNotifier extends _$PlayerSettingsNotifier {
       subtitleOutline: subOutline,
       subtitleShadow: subShadow,
       subtitleRaise: subRaise,
+      subtitleAutoAdjust: subAutoAdjust,
       subtitleBold: subBold,
       subtitleFont: subFont,
       subtitleTextOpacity: subTextOpacity,
@@ -910,12 +929,35 @@ class PlayerSettingsNotifier extends _$PlayerSettingsNotifier {
 
   /// Held to [kSubtitleRaises]' range, so a lift from an older or newer build
   /// lands inside what this one offers.
+  ///
+  /// A manual lift is the viewer positioning by hand — a swipe on the
+  /// video, the Position dropdown, the Manual slider — so Auto-Adjust
+  /// goes off with it and the saved raise is what the caption uses.
+  /// Only writes the Auto-Adjust key when it was on: the common path (a
+  /// swipe while it is already off) stays one write.
   Future<void> setSubtitleRaise(double raise) async {
     final value = raise
         .clamp(kSubtitleRaises.first, kSubtitleRaises.last)
         .toDouble();
     await _repository.setPlayerSetting('player_sub_raise', value);
-    _update((PlayerSettings c) => c.copyWith(subtitleRaise: value));
+    if (state.value?.subtitleAutoAdjust ?? false) {
+      await _repository.setPlayerSetting('player_sub_auto_adjust', false);
+      _update(
+        (PlayerSettings c) => c.copyWith(
+          subtitleRaise: value,
+          subtitleAutoAdjust: false,
+        ),
+      );
+    } else {
+      _update((PlayerSettings c) => c.copyWith(subtitleRaise: value));
+    }
+  }
+
+  /// Auto-Adjust (+27): on, the caption positions itself and the saved
+  /// raise is ignored; off, the saved raise is what the caption uses.
+  Future<void> setSubtitleAutoAdjust(bool auto) async {
+    await _repository.setPlayerSetting('player_sub_auto_adjust', auto);
+    _update((PlayerSettings c) => c.copyWith(subtitleAutoAdjust: auto));
   }
 
   Future<void> setSubtitleBold(bool bold) async {
@@ -988,6 +1030,10 @@ class PlayerSettingsNotifier extends _$PlayerSettingsNotifier {
       fresh.subtitleShadow,
     );
     await _repository.setPlayerSetting('player_sub_raise', fresh.subtitleRaise);
+    await _repository.setPlayerSetting(
+      'player_sub_auto_adjust',
+      fresh.subtitleAutoAdjust,
+    );
     await _repository.setPlayerSetting('player_sub_bold', fresh.subtitleBold);
     await _repository.setPlayerSetting(
       'player_sub_font',
@@ -1011,6 +1057,7 @@ class PlayerSettingsNotifier extends _$PlayerSettingsNotifier {
         subtitleOutline: fresh.subtitleOutline,
         subtitleShadow: fresh.subtitleShadow,
         subtitleRaise: fresh.subtitleRaise,
+        subtitleAutoAdjust: fresh.subtitleAutoAdjust,
         subtitleBold: fresh.subtitleBold,
         subtitleFont: fresh.subtitleFont,
         subtitleTextOpacity: fresh.subtitleTextOpacity,

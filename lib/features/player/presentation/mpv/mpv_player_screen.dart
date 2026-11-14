@@ -62,6 +62,7 @@ import 'package:vlc_player/vlc_player.dart';
 
 import '../../../../core/domain/entity/multimedia_item.dart';
 import '../../../../core/providers/device_info_provider.dart';
+import '../../../../core/providers/thermal_state.dart';
 import '../../../../core/services/notification_service.dart';
 import '../../../../core/storage/episode_watch_repository.dart';
 import '../../../../core/storage/history_repository.dart';
@@ -88,7 +89,9 @@ import '../vlc/panel/player_panel_labels.dart';
 import '../vlc/player_startup_view.dart';
 import 'golden_player_controls.dart';
 import 'mpv_android_options.dart';
+import 'mpv_ios_options.dart';
 import 'mpv_subtitle_style.dart';
+import 'mpv_thermal_quality.dart';
 import 'mpv_vlc_controller.dart';
 
 /// mpv demuxer cache, forward AND backward, in bytes.
@@ -153,6 +156,13 @@ const Duration _kPrebufferMaxWaitHighBitrate = Duration(seconds: 6);
 /// that dropped its request twice; a third would just stall again on
 /// the same line, and the failover ladder has others to try.
 const int _kStallMaxReopens = 2;
+
+/// How often the thermal watch reads the phone's heat while a film plays
+/// (iOS only, see [_onThermalTick]). 30s is slow enough to cost nothing
+/// and fast enough to catch a phone heating up mid-film; the stall
+/// watchdog's 2s tick is not reused — a channel read every 2s would be
+/// noise.
+const Duration _kThermalPoll = Duration(seconds: 30);
 
 /// Pinch-zoom range, same as the VLC screen.
 const double _kMinZoom = 0.5;
@@ -328,6 +338,16 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// The stall watchdog's tick, every 2s while the screen lives.
   Timer? _stallTimer;
 
+  /// The thermal watch's tick, every [_kThermalPoll] while the screen
+  /// lives (iOS only): reads the phone's heat and drops a 4K stream for
+  /// 1080p when it is serious or critical (see [_onThermalTick]).
+  Timer? _thermalTimer;
+
+  /// The thermal-aware quality governor (see `mpv_thermal_quality.dart`):
+  /// decides, per thermal tick, whether the phone's heat wants a quality
+  /// change. Pure — the screen acts on its decision.
+  final ThermalQualityGovernor _thermalGovernor = ThermalQualityGovernor();
+
   /// Where the open source started (its resume point, else zero): the
   /// pre-buffer cushion is measured from here, not from the stream start.
   Duration _openStart = Duration.zero;
@@ -498,6 +518,7 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     _watchdogTimer?.cancel();
     _prebufferTimer?.cancel();
     _stallTimer?.cancel();
+    _thermalTimer?.cancel();
     _pipWatchdog?.cancel();
     // The native side remembers the last synced playing state (see the
     // playing listener): clear it now, or a film left playing would make
@@ -817,12 +838,25 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     // after the VideoController (which owns `hwdec`) exists and before
     // the first open, so they govern every file this player loads.
     // Best-effort: a failure leaves media_kit's defaults in place and
-    // the open still goes ahead. iOS is untouched — its path is smooth
-    // as it is.
+    // the open still goes ahead. iOS gets its own options below.
     if (defaultTargetPlatform == TargetPlatform.android) {
       final platform = _player.platform;
       if (platform is NativePlayer) {
         await applyMpvAndroidOptions(platform);
+      }
+    }
+    // iOS-only mpv options (see mpv_ios_options.dart): the VideoToolbox
+    // fallback Nuvio sets, so a session invalidated under heat is
+    // recreated instead of dropping to software decode for the rest of
+    // the file, plus the same framedrop policy Android has. 4K is smooth
+    // on iOS until the phone heats up, and then it was not (user report
+    // 2026-11-15) — this is the first half of that fix, the
+    // thermal-aware quality drop in [_onThermalTick] the second.
+    // Best-effort like the Android options above.
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      final iosPlatform = _player.platform;
+      if (iosPlatform is NativePlayer) {
+        await applyMpvIosOptions(iosPlatform);
       }
     }
     // Subtitle options for every platform (+26): mpv's `secondary-sid`
@@ -844,6 +878,16 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       const Duration(seconds: 2),
       (_) => _onStallTick(),
     );
+    // The thermal watch (iOS only): a tick every [_kThermalPoll] that
+    // reads the phone's heat and drops a 4K stream for 1080p when it is
+    // serious or critical, restoring it when the phone cools (see
+    // [_onThermalTick]).
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      _thermalTimer = Timer.periodic(
+        _kThermalPoll,
+        (_) => unawaited(_onThermalTick()),
+      );
+    }
     await _resolveAndOpen();
   }
 
@@ -1312,6 +1356,56 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
           _tryNextStream();
         }
     }
+  }
+
+  /// The thermal watch's tick (iOS only, every [_kThermalPoll] while the
+  /// screen lives): reads the phone's heat and asks the governor whether
+  /// it wants a quality change. Stands down unless a film is actually
+  /// playing — a paused film needs no drop, and the governor's restore
+  /// streak only counts while playing. A switch is the same
+  /// [_pickSource] a tap on a source row makes, so it re-opens at the
+  /// playhead, re-applies the remembered audio/subtitle tracks, and
+  /// earns a fresh stall budget (see [_openStream]).
+  Future<void> _onThermalTick() async {
+    if (_disposed || !_startedPlaying || !_playing) return;
+    final decision = _thermalGovernor.evaluate(
+      thermal: await readThermalState(),
+      qualities: _streams.map((stream) => stream.quality).toList(),
+      currentIndex: _streamIndex,
+    );
+    if (decision.isNone || _disposed) return;
+    switch (decision.kind) {
+      case ThermalQualityKind.none:
+        break;
+      case ThermalQualityKind.drop:
+        ref.read(notificationServiceProvider).showInfo(
+          'Phone is heating up — switched to '
+          '${_thermalTargetLabel(decision.targetIndex)} to stay smooth',
+          title: 'Phone is hot',
+        );
+        unawaited(_pickSource(decision.targetIndex));
+      case ThermalQualityKind.restore:
+        ref.read(notificationServiceProvider).showInfo(
+          'Phone cooled down — back to '
+          '${_thermalTargetLabel(decision.targetIndex)}',
+          title: 'Phone cooled down',
+        );
+        unawaited(_pickSource(decision.targetIndex));
+      case ThermalQualityKind.hint:
+        ref.read(notificationServiceProvider).showInfo(
+          'Phone is heating up — pick a lower quality in the Quality '
+          'tab to stay smooth',
+          title: 'Phone is hot',
+        );
+    }
+  }
+
+  /// The label a thermal switch's toast names ("1080p", "720p"): the
+  /// target stream's height, or a generic word when it has none.
+  String _thermalTargetLabel(int index) {
+    if (index < 0 || index >= _streams.length) return 'a lower quality';
+    final quality = _streams[index].quality;
+    return quality != null && quality > 0 ? '${quality}p' : 'a lower quality';
   }
 
   void _armWatchdog() {
@@ -2056,7 +2150,13 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
                     ref.read(playerSettingsProvider.notifier),
                 onPickEpisode: (episode) =>
                     unawaited(_pickEpisode(episode)),
-                onPickSource: (index) => unawaited(_pickSource(index)),
+                onPickSource: (index) {
+                  // A hand pick: the thermal governor never overrides it
+                  // while the hot episode lasts (see
+                  // `mpv_thermal_quality.dart`).
+                  _thermalGovernor.noteManualPick(index);
+                  unawaited(_pickSource(index));
+                },
                 onAudioPicked: (track) {
                   // Remembered across failover: the next source re-applies
                   // it — and persisted across opens, so AUTO plays it next

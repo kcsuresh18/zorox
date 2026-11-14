@@ -24,7 +24,9 @@
 ///     dropdown writes it, and so do the swipes on the video (horizontal:
 ///     right lifts, left drops; centre-third vertical: up lifts, down
 ///     drops), through `setSubtitleRaise`, which holds it to the stock
-///     range [0, 0.2].
+///     range [0, 0.2]. Auto-Adjust (+27) ignores the saved raise and
+///     sits the caption just above the bottom controls while they are
+///     visible, low when hidden (see [subtitleEffectiveRaise]).
 library;
 
 import 'package:flutter/material.dart';
@@ -71,6 +73,14 @@ const List<String> kMpvSubtitleEdges = <String>['None', 'Outline', 'Shadow'];
 /// saved raise still lifts it from there. The PiP window keeps its own
 /// smaller padding below.
 const double kMpvSubtitlePaddingBottom = 16;
+
+/// The bottom padding Auto-Adjust uses while the bottom controls are
+/// visible (+27): the caption sits just above them. 116px is the pre-+25
+/// chrome-up padding — the bars themselves measure ~110–131px (seekbar +
+/// buttons + SafeArea) — so the caption clears them without floating far
+/// above the picture. With the chrome hidden Auto-Adjust uses the same
+/// 16px base as the manual position.
+const double kMpvSubtitlePaddingBottomControlsVisible = 116;
 
 /// The PiP window's subtitle scale: Android PiP is a tiny window (about a
 /// third of the screen's width on a phone), and the caption is a Flutter
@@ -161,24 +171,31 @@ List<Shadow>? _mpvSubtitleShadows(PlayerSettings settings) {
 /// [screenHeight] is the landscape screen height, the frame the raise is a
 /// share of. The lift is added on top of the fixed base padding.
 ///
-/// [controlsVisible] no longer moves the caption (+25): the base padding is
-/// the same whether the chrome is up or down, locked or unlocked, so the
-/// caption never jumps when the controls or the lock pill appear. The
-/// parameter stays so call sites keep passing the chrome state and tests
-/// can assert the independence.
+/// [controlsVisible] no longer moves the caption (+25) — unless
+/// Auto-Adjust is on (+27): then the caption sits just above the bottom
+/// controls while they are visible and low when they are hidden, and the
+/// saved raise is ignored. The parameter stays so call sites keep passing
+/// the chrome state and tests can assert the independence in the manual
+/// case and the dependence in the auto case.
 ///
 /// [isPip] is the Android PiP window: the font is halved and the padding
 /// shrunk to PiP proportions (see [kMpvSubtitlePipFontScale]) — the
 /// overlay is fixed logical pixels and does not scale with the window.
 /// The raise still applies, but it is a share of the PiP window's own
-/// (small) height, so it shrinks with it.
+/// (small) height, so it shrinks with it. Auto-Adjust is ignored in PiP:
+/// there is no chrome in the window, so the manual raise applies.
 SubtitleViewConfiguration mpvSubtitleViewConfiguration(
   PlayerSettings settings, {
   required double screenHeight,
   required bool controlsVisible,
   bool isPip = false,
 }) {
-  final liftPx = settings.subtitleRaise.clamp(0.0, 0.5) * screenHeight;
+  // Auto-Adjust (+27): the automatic position, not the saved raise.
+  // Off in PiP — no chrome there, the manual raise applies.
+  final autoAdjust = settings.subtitleAutoAdjust && !isPip;
+  final liftPx =
+      (autoAdjust ? 0.0 : settings.subtitleRaise.clamp(0.0, 0.5)) *
+      screenHeight;
   if (isPip) {
     return SubtitleViewConfiguration(
       style: mpvSubtitleTextStyle(settings, isPip: true),
@@ -193,8 +210,11 @@ SubtitleViewConfiguration mpvSubtitleViewConfiguration(
     );
   }
   // One fixed base in every state (+25): the caption used to sit at 40px
-  // with the chrome hidden and 116px with it up.
-  const base = kMpvSubtitlePaddingBottom;
+  // with the chrome hidden and 116px with it up. Auto-Adjust (+27) puts
+  // it just above the controls while they are visible, low when hidden.
+  final base = autoAdjust && controlsVisible
+      ? kMpvSubtitlePaddingBottomControlsVisible
+      : kMpvSubtitlePaddingBottom;
   return SubtitleViewConfiguration(
     style: mpvSubtitleTextStyle(settings),
     textAlign: TextAlign.center,

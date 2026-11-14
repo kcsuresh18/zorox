@@ -152,7 +152,8 @@ class _SideCarSubtitleViewState extends State<SideCarSubtitleView> {
     // so they never move when the controls show or hide. Bottom lines
     // only: a line placed at the top or the middle stays there.
     final bottomOffset =
-        area.height - subtitleTargetY(area, widget.settings.subtitleRaise);
+        area.height -
+        subtitleTargetY(area, subtitleEffectiveRaise(widget.settings));
 
     // Where two lines are due together the earlier one keeps its place and
     // the later one stacks away from the edge, as libass lays them out.

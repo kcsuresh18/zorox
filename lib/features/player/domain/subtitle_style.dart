@@ -113,6 +113,16 @@ VlcSubtitleStyle subtitleEngineStyleFrom(PlayerSettings settings) {
   );
 }
 
+/// The raise the caption actually uses: the saved raise, or 0 when
+/// Auto-Adjust is on (+27) — the automatic position is the fixed low
+/// target, and the saved raise is ignored until Auto-Adjust goes off.
+/// The mpv path uses the same rule inline in
+/// `mpvSubtitleViewConfiguration` (it also needs the controls state);
+/// this is the libVLC path, where the anchored look's target is already
+/// fixed low.
+double subtitleEffectiveRaise(PlayerSettings settings) =>
+    settings.subtitleAutoAdjust ? 0.0 : settings.subtitleRaise;
+
 /// The look libVLC's lines take while the video plays: see
 /// `VlcPlayerController.setSubtitleLook`.
 ///
@@ -140,7 +150,7 @@ VlcSubtitleLook subtitleLookFrom(
     backgroundOpacity:
         (settings.subtitleBackgroundOpacity.clamp(0.0, 1.0) * 255).round(),
     outlineThickness: subtitleOutlineThickness(settings.subtitleOutline),
-    raise: settings.subtitleRaise,
+    raise: subtitleEffectiveRaise(settings),
   );
 }
 
@@ -268,7 +278,8 @@ VlcSubtitleLook subtitleLookAnchored(
   // not the picture's — see [subtitleTargetY]. The chrome height is
   // deliberately not in it: v13 anchored to it and floated the lines a
   // full bar above the picture even with the controls down.
-  final targetY = subtitleTargetY(screen, settings.subtitleRaise);
+  final targetY =
+      subtitleTargetY(screen, subtitleEffectiveRaise(settings));
   // How far above the picture's bottom the lines must sit to land there,
   // in the picture's own pixels, as a share of its height. Clamped at 0:
   // on a pinch-out the picture's bottom is above the target and libVLC
