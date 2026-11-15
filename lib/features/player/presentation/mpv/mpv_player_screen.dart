@@ -762,16 +762,22 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
         ),
       },
       onModeChanged: (inPip) {
-        if (!mounted || _disposed || inPip == _inPip) return;
+        if (!mounted || _disposed) return;
         // The attempt's answer, whatever it is: the watchdog stands down.
+        // This must run BEFORE the state-match return below: _enterPip
+        // sets _inPip optimistically, so on a successful entry the event
+        // arrives with inPip == _inPip and the old early return skipped
+        // the cancel — the watchdog then fired at 5 s and flipped the
+        // player out of PiP (Android: black window until the reset).
         _pipWatchdog?.cancel();
         _pipWatchdog = null;
+        if (inPip) _pipWindowOpened = true;
+        if (inPip == _inPip) return;
         // The other way into PiP: the viewer swiped home and the
         // auto-enter below never ran, or the system's own PiP control
         // opened it. A locked PiP window has no chip in it, so the lock
         // clears on the way in.
         if (inPip) {
-          _pipWindowOpened = true;
           _pipAttemptFromButton = false;
           _locked.value = false;
         }
@@ -2714,7 +2720,14 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
           // only in dispose()), so unmounting the widget stops the
           // Flutter texture path while the PiP tap keeps receiving
           // frames. A black placeholder keeps the stack's layout.
-          if (_inPip)
+          //
+          // iOS ONLY (+38): on Android the PiP window IS the Flutter UI —
+          // there is no separate native feed — so unmounting here blacks
+          // the window for one watchdog interval (~5 s) and defeats the
+          // +24 PiP subtitle halving (the SubtitleView only exists while
+          // the Video is mounted). Android keeps the Video mounted and
+          // the isPip wiring halves the captions as designed.
+          if (_inPip && defaultTargetPlatform == TargetPlatform.iOS)
             const ColoredBox(color: Colors.black)
           else
             ValueListenableBuilder<double>(
