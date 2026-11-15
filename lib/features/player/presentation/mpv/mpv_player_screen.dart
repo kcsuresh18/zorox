@@ -834,8 +834,10 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   ///
   /// Runs in [_init] when the viewer turned the setting on. The native
   /// layer is created once, up front, so the button and auto-PiP both
-  /// have a source ready; frames are throttled to ~5 fps until the
-  /// window actually opens. `isSupported` is checked first: a device
+  /// have a source ready; no frames are enqueued until the window
+  /// actually opens (+29 — before that the layer sits behind Flutter's
+  /// view and any frame in it would show as a second copy of the video
+  /// inside the app). `isSupported` is checked first: a device
   /// without PiP leaves the bridge null and the button hidden. The
   /// trailing setState rebuilds once support is known, so the button
   /// appears on the first play rather than the next rebuild.
@@ -2271,35 +2273,49 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
           // is its own repaint boundary: the chrome above it rebuilds on
           // every position tick, and without the boundary each of those
           // rebuilds re-rasterizes the 4K texture layer with it.
-          ValueListenableBuilder<double>(
-            valueListenable: _videoScale,
-            builder: (context, scale, child) => Transform.scale(
-              scale: scale.clamp(_kMinZoom, _kMaxZoom),
-              alignment: Alignment.center,
-              child: child,
-            ),
-            child: RepaintBoundary(
-              child: Center(
-                child: Video(
-                  key: _videoKey,
-                  controller: _videoController,
-                  fit: _boxFitFor(_fit),
-                  fill: Colors.black,
-                  // The stock controls below; media_kit's own are hidden.
-                  controls: (_) => const SizedBox.shrink(),
-                  wakelock: true,
-                  // iOS mpv PiP (+28): when the player runs the software
-                  // renderer for PiP, the film must NOT pause when the app
-                  // backgrounds — the PiP window IS the background
-                  // playback, and a pause here would freeze it on the
-                  // first frame. Off by default: without PiP the
-                  // background pause is today's behaviour.
-                  pauseUponEnteringBackgroundMode: !_iosMpvPipEnabled,
-                  subtitleViewConfiguration: subtitleConfig,
+          //
+          // While the iOS mpv PiP window is up (+29) the film must NOT
+          // show here as well: the software renderer would draw it twice
+          // — once into this Flutter texture and once into the PiP layer
+          // — saturating the CPU, starving mpv's audio thread (cut-cut
+          // voice) and dropping frames. The Video widget is only a
+          // consumer: the render loop is mpv-driven (VideoOutput, owned
+          // by the VideoController, which this screen keeps and disposes
+          // only in dispose()), so unmounting the widget stops the
+          // Flutter texture path while the PiP tap keeps receiving
+          // frames. A black placeholder keeps the stack's layout.
+          if (_inPip)
+            const ColoredBox(color: Colors.black)
+          else
+            ValueListenableBuilder<double>(
+              valueListenable: _videoScale,
+              builder: (context, scale, child) => Transform.scale(
+                scale: scale.clamp(_kMinZoom, _kMaxZoom),
+                alignment: Alignment.center,
+                child: child,
+              ),
+              child: RepaintBoundary(
+                child: Center(
+                  child: Video(
+                    key: _videoKey,
+                    controller: _videoController,
+                    fit: _boxFitFor(_fit),
+                    fill: Colors.black,
+                    // The stock controls below; media_kit's own are hidden.
+                    controls: (_) => const SizedBox.shrink(),
+                    wakelock: true,
+                    // iOS mpv PiP (+28): when the player runs the software
+                    // renderer for PiP, the film must NOT pause when the app
+                    // backgrounds — the PiP window IS the background
+                    // playback, and a pause here would freeze it on the
+                    // first frame. Off by default: without PiP the
+                    // background pause is today's behaviour.
+                    pauseUponEnteringBackgroundMode: !_iosMpvPipEnabled,
+                    subtitleViewConfiguration: subtitleConfig,
+                  ),
                 ),
               ),
             ),
-          ),
 
           // Resolving: the source list. It stays up until the first source
           // actually plays — the list is the control, and the first open is

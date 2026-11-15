@@ -75,7 +75,9 @@ class MpvPipIos {
   /// Creates the native source layer and arms frame delivery.
   ///
   /// Call once, after the player is created and the media is loaded.
-  /// The native side starts throttled (~5 fps) until PiP opens.
+  /// The native side enqueues no frames until the PiP window actually
+  /// opens (+29); the layer sits behind Flutter's view and a frame in
+  /// it would show as a second copy of the video inside the app.
   Future<void> prepare({
     required Duration position,
     required Duration duration,

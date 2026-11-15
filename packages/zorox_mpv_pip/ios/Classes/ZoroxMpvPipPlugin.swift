@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import AVKit
 import CoreMedia
@@ -5,6 +6,22 @@ import CoreVideo
 import Flutter
 import Foundation
 import UIKit
+
+/// Host view for the PiP display layer. CALayer sublayers do NOT follow
+/// their superlayer's bounds, so the host must push its size into the
+/// layer on every layout pass. Without this, a layer framed while the
+/// window was portrait keeps a portrait frame after the player rotates
+/// to landscape — and PiP opens a narrow vertical strip (+29).
+private final class PipHostView: UIView {
+  weak var displayLayer: AVSampleBufferDisplayLayer?
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    if let layer = displayLayer, layer.frame != bounds {
+      layer.frame = bounds
+    }
+  }
+}
 
 /// iOS Picture-in-Picture for the mpv (Golden) player.
 ///
@@ -31,6 +48,16 @@ import UIKit
 /// overlay is a Flutter widget. mpv's own subtitles do: the Dart side
 /// switches `sub-visibility` on when PiP actually starts and restores it
 /// when PiP stops, so they burn into the frame.
+///
+/// +29: frames are enqueued ONLY while the PiP window is actually up
+/// (gated on the PiP delegate, not the request), the feed is downscaled
+/// to ~640 px wide (vImage), and the in-app Video widget is unmounted
+/// while PiP is up — the +28 build drew the film twice (Flutter texture
+/// + PiP layer), saturating the CPU (cut-cut voice, dropped frames) and
+/// leaving a second copy of the video visible inside the app. The
+/// display layer also tracks the window on rotation now: a layer framed
+/// while portrait stayed portrait after the player rotated, and PiP
+/// opened a narrow vertical strip.
 ///
 /// Own channel `dev.akash.skystream.player/pip_mpv_ios` — deliberately NOT
 /// `dev.akash.skystream.player/pip`, which the libVLC side already uses;
@@ -78,7 +105,6 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     label: "dev.akash.skystream.pip.frame"
   )
   private var frameCount = 0
-  private var lastFrameTime: CFAbsoluteTime = 0
 
   init(channel: FlutterMethodChannel) {
     self.channel = channel
@@ -148,11 +174,14 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       // Full-window host behind Flutter's view, NOT hidden: PiP refuses
       // to start for a layer that is hidden or outside the window
       // hierarchy. Flutter's own view sits on top of it, so the layer
-      // never shows inline — it only feeds the PiP window.
-      let host = UIView(frame: rootView.bounds)
+      // never shows inline — it only feeds the PiP window. The host is
+      // a PipHostView (+29) so the layer tracks the window on rotation:
+      // a plain sublayer keeps the frame it was created with.
+      let host = PipHostView(frame: rootView.bounds)
       host.autoresizingMask = [.flexibleWidth, .flexibleHeight]
       host.isHidden = false
       displayLayer.frame = host.bounds
+      host.displayLayer = displayLayer
       host.layer.addSublayer(displayLayer)
       rootView.insertSubview(host, at: 0)
 
@@ -225,6 +254,17 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     pip?.invalidatePlaybackState()
   }
 
+  /// Pushes the host's current bounds into the display layer. The
+  /// host's layoutSubviews does this on every rotation; this is the
+  /// belt-and-braces call right before PiP starts, so the window is
+  /// shaped by the window's size now, not by the size at prepare time.
+  private func syncLayerFrame() {
+    guard let host = hostView, let layer = layer else { return }
+    if layer.frame != host.bounds {
+      layer.frame = host.bounds
+    }
+  }
+
   private func enter(_ result: @escaping FlutterResult) {
     guard let pip = pip else {
       result(
@@ -241,6 +281,7 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       return
     }
     if pip.isPictureInPicturePossible {
+      syncLayerFrame()
       pip.startPictureInPicture()
       result(true)
       return
@@ -268,6 +309,7 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     pool = nil
     lock.lock()
     armed = false
+    pipActive = false
     prepared = false
     lock.unlock()
   }
@@ -287,8 +329,8 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   }
 
   /// Layer status, whether the layer is in a window, whether PiP can
-  /// start, the audio category, and how many frames the tap delivered —
-  /// the first thing to check when PiP fails on a phone.
+  /// start, the audio category, and how many frames reached the PiP
+  /// layer — the first thing to check when PiP fails on a phone.
   private func diag() -> String {
     "layer=\(layer?.status.rawValue ?? -1) "
       + "inWindow=\(hostView?.window != nil) "
@@ -302,22 +344,37 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   private func ingest(_ pb: CVPixelBuffer) {
     lock.lock()
     let isArmed = armed
+    let isPipActive = pipActive
     let targetLayer = layer
     lock.unlock()
-    guard isArmed, let layer = targetLayer else { return }
+    // Frames feed the PiP window ONLY while it is actually up (+29):
+    // before PiP opens, and after it stops, the display layer sits
+    // full-window behind Flutter's view — any frame enqueued there
+    // shows as a second copy of the video inside the app. The old
+    // ~5 fps pre-PiP trickle is gone for the same reason. The gate is
+    // driven by the PiP delegate (willStart/didStop), not by the
+    // request, so it covers both the button path and auto-PiP on a
+    // home swipe.
+    guard isArmed, isPipActive, let layer = targetLayer else { return }
 
-    // Before PiP starts the frames only prove the tap works: ~5 fps is
-    // enough and saves the CPU. Once the window is up, full rate.
-    let now = CFAbsoluteTimeGetCurrent()
-    if !pipActive && now - lastFrameTime < 0.2 { return }
-    lastFrameTime = now
+    // The PiP window is small: full-res 1080p frames through the copy
+    // + compositor are wasted work and helped saturate the CPU (+29).
+    // Cap the feed at ~640 px wide; the aspect is preserved and the
+    // height is kept even (BGRA rows).
+    let sw = CVPixelBufferGetWidth(pb)
+    let sh = CVPixelBufferGetHeight(pb)
+    let maxPipWidth = 640
+    let tw: Int
+    let th: Int
+    if sw > maxPipWidth {
+      tw = maxPipWidth
+      th = max(2, (sh * maxPipWidth / sw) & ~1)
+    } else {
+      tw = sw
+      th = sh
+    }
 
-    guard
-      let dst = makeBuffer(
-        CVPixelBufferGetWidth(pb),
-        CVPixelBufferGetHeight(pb)
-      )
-    else { return }
+    guard let dst = makeBuffer(tw, th) else { return }
     copyFrame(src: pb, dst: dst)
     frameQueue.async { [weak self] in
       self?.enqueue(dst, on: layer)
@@ -326,10 +383,16 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
 
   /// Synchronous copy into our own IOSurface-backed BGRA pool: the
   /// renderer reuses its buffer on the next render, so the tap's buffer
-  /// must not be handed to the display layer as-is.
+  /// must not be handed to the display layer as-is. When the target is
+  /// smaller than the source (+29 downscale) the copy scales with
+  /// vImage (SIMD): both buffers are 32BGRA, 4 bytes/pixel, and scaling
+  /// is channel-order agnostic, so ARGB8888 is the right routine for
+  /// BGRA data too.
   private func copyFrame(src: CVPixelBuffer, dst: CVPixelBuffer) {
-    let w = CVPixelBufferGetWidth(src)
-    let h = CVPixelBufferGetHeight(src)
+    let sw = CVPixelBufferGetWidth(src)
+    let sh = CVPixelBufferGetHeight(src)
+    let dw = CVPixelBufferGetWidth(dst)
+    let dh = CVPixelBufferGetHeight(dst)
     CVPixelBufferLockBaseAddress(src, .readOnly)
     CVPixelBufferLockBaseAddress(dst, [])
     defer {
@@ -342,13 +405,34 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     else { return }
     let sb = CVPixelBufferGetBytesPerRow(src)
     let db = CVPixelBufferGetBytesPerRow(dst)
-    if sb == db {
-      memcpy(d, s, sb * h)
-    } else {
-      for y in 0..<h {
-        memcpy(d + y * db, s + y * sb, min(sb, db))
+    if sw == dw && sh == dh {
+      if sb == db {
+        memcpy(d, s, sb * sh)
+      } else {
+        for y in 0..<sh {
+          memcpy(d + y * db, s + y * sb, min(sb, db))
+        }
       }
+      return
     }
+    var srcBuf = vImage_Buffer(
+      data: s,
+      height: vImagePixelCount(sh),
+      width: vImagePixelCount(sw),
+      rowBytes: sb
+    )
+    var dstBuf = vImage_Buffer(
+      data: d,
+      height: vImagePixelCount(dh),
+      width: vImagePixelCount(dw),
+      rowBytes: db
+    )
+    _ = vImageScale_ARGB8888(
+      &srcBuf,
+      &dstBuf,
+      nil,
+      vImage_Flags(kvImageNoFlags)
+    )
   }
 
   private func makeBuffer(_ w: Int, _ h: Int) -> CVPixelBuffer? {
@@ -439,7 +523,9 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     _ controller: AVPictureInPictureController
   ) {
     // Full-rate frames from here on.
+    lock.lock()
     pipActive = true
+    lock.unlock()
   }
 
   public func pictureInPictureControllerDidStartPictureInPicture(
@@ -451,7 +537,7 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   public func pictureInPictureControllerDidStopPictureInPicture(
     _ controller: AVPictureInPictureController
   ) {
-    pipActive = false
+    stopPipFeed()
     channel.invokeMethod("pipStopped", arguments: ["restored": false])
   }
 
@@ -460,7 +546,7 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     restoreUserInterfaceForPictureInPictureStopWithCompletionHandler
       completionHandler: @escaping (Bool) -> Void
   ) {
-    pipActive = false
+    stopPipFeed()
     channel.invokeMethod("pipStopped", arguments: ["restored": true])
     completionHandler(true)
   }
@@ -469,11 +555,23 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     _ controller: AVPictureInPictureController,
     failedToStartPictureInPictureWithError error: Error
   ) {
-    pipActive = false
+    stopPipFeed()
     channel.invokeMethod(
       "pipFailed",
       arguments: ["reason": "\(error.localizedDescription) | \(diag())"]
     )
+  }
+
+  /// Stops the PiP feed and empties the display layer (+29): the layer
+  /// sits full-window behind Flutter's view, and a stale frame left in
+  /// it would keep showing as a second copy of the video inside the
+  /// app after PiP stops.
+  private func stopPipFeed() {
+    lock.lock()
+    pipActive = false
+    let targetLayer = layer
+    lock.unlock()
+    targetLayer?.flushAndRemoveImage()
   }
 
   public func pictureInPictureControllerIsPlaybackPaused(
