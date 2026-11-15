@@ -691,26 +691,34 @@ class _ExploreCarouselState extends ConsumerState<ExploreCarousel>
     required BuildContext context,
   }) {
     final logoUrl = movie.logoUrl;
-    final title = movie.title;
     final year = movie.year?.toString() ?? '';
     final genres = movie.tags?.join(' • ') ?? '';
-    final provider = movie.provider;
 
     String? type;
     final mType = movie.mediaType.toLowerCase();
     if (mType == 'movie') {
-      type = "Movie";
+      type = 'Movie';
     } else if (mType == 'series' || mType == 'tv') {
-      type = "TV Show";
+      type = 'TV Show';
     } else if (mType == 'anime') {
-      type = "Anime";
+      type = 'Anime';
     } else if (mType == 'livestream') {
-      type = "Live Stream";
+      type = 'Live Stream';
     } else {
       type = mType.isNotEmpty
           ? mType[0].toUpperCase() + mType.substring(1)
           : null;
     }
+
+    // +42: the hero shows the poster only — no big overlaid title text,
+    // no badge pills. The poster's own artwork (or its TMDB logo, when
+    // one exists) is the title. The type lives in the meta line now.
+    final metaParts = <String>[
+      if (type != null) type,
+      if (genres.isNotEmpty) genres,
+      if (year.isNotEmpty) year,
+    ];
+    final meta = metaParts.join(' • ');
 
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -718,63 +726,62 @@ class _ExploreCarouselState extends ConsumerState<ExploreCarousel>
           ? CrossAxisAlignment.start
           : CrossAxisAlignment.center,
       children: [
+        // The item's own title logo, when TMDB has one. When there is
+        // none, nothing is rendered here — no giant fallback text: the
+        // backdrop artwork itself is the title (see the CLAYFACE
+        // reference: the red logo is part of the poster).
         if (logoUrl != null)
           Padding(
             padding: const EdgeInsets.only(bottom: LayoutConstants.spacingLg),
-            child: _buildLogo(logoUrl, title, isDesktop: isDesktop),
-          )
-        else
-          _buildTitleFallback(title, isDesktop: isDesktop),
-        Wrap(
-          alignment: isDesktop ? WrapAlignment.start : WrapAlignment.center,
-          crossAxisAlignment: WrapCrossAlignment.center,
-          spacing: 8.0,
-          runSpacing: 4.0,
-          children: [
-            if (provider != null && provider.isNotEmpty) ...[
-              _buildMiniBadge(
-                context,
-                provider.toUpperCase(),
-                isProvider: true,
+            child: _buildLogo(logoUrl, isDesktop: isDesktop),
+          ),
+        if (meta.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 12),
+            child: Text(
+              meta,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: isDesktop ? TextAlign.left : TextAlign.center,
+              style: theme.textTheme.labelLarge?.copyWith(
+                color: Colors.white.withValues(alpha: 0.9),
+                fontWeight: FontWeight.w600,
               ),
-            ],
-            if (type != null) ...[_buildMiniBadge(context, type.toUpperCase())],
-            if (genres.isNotEmpty) ...[
-              Text(
-                genres,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.labelSmall?.copyWith(
-                  color: Colors.white.withValues(alpha: 0.7),
-                ),
-              ),
-            ],
-            if (year.isNotEmpty) ...[
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    Icons.calendar_today_rounded,
-                    size: 10,
-                    color: Colors.white.withValues(alpha: 0.6),
-                  ),
-                  const SizedBox(width: 4),
-                  Text(
-                    year,
-                    style: theme.textTheme.labelSmall?.copyWith(
-                      color: Colors.white.withValues(alpha: 0.7),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ],
+            ),
+          ),
+        // View Details — same destination as tapping the poster.
+        ElevatedButton(
+          onPressed: () => _openMovie(context, movie),
+          style: ElevatedButton.styleFrom(
+            backgroundColor: Colors.white,
+            foregroundColor: Colors.black87,
+            elevation: 0,
+            padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 12),
+            shape: const StadiumBorder(),
+            textStyle: const TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          child: const Text('View Details'),
         ),
       ],
     );
   }
 
-  Widget _buildLogo(String logoUrl, String title, {bool isDesktop = false}) {
+  /// Opens an item's details — the same destination as tapping the hero
+  /// poster itself (+42: the View Details button reuses it).
+  void _openMovie(BuildContext context, MultimediaItem movie) {
+    if (widget.onTap != null) {
+      widget.onTap!(movie);
+    } else {
+      _navigateToDetails(context, movie);
+    }
+  }
+
+  /// The item's own title logo (TMDB), when one exists. A failed load
+  /// renders nothing — never the giant fallback title (+42).
+  Widget _buildLogo(String logoUrl, {bool isDesktop = false}) {
     if (logoUrl.toLowerCase().endsWith('.svg')) {
       return SvgPicture.network(
         logoUrl,
@@ -784,7 +791,7 @@ class _ExploreCarouselState extends ConsumerState<ExploreCarousel>
         placeholderBuilder: (context) =>
             const SizedBox(height: 140, width: 300),
         errorBuilder: (context, error, stackTrace) =>
-            _buildTitleFallback(title, isDesktop: isDesktop),
+            const SizedBox.shrink(),
       );
     }
     return CachedNetworkImage(
@@ -794,57 +801,7 @@ class _ExploreCarouselState extends ConsumerState<ExploreCarousel>
       fit: BoxFit.contain,
       alignment: Alignment.bottomCenter,
       placeholder: (context, url) => const SizedBox(height: 140, width: 300),
-      errorWidget: (context, url, error) =>
-          _buildTitleFallback(title, isDesktop: isDesktop),
-    );
-  }
-
-  Widget _buildTitleFallback(String title, {bool isDesktop = false}) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: LayoutConstants.spacingXs),
-      child: Text(
-        title.toUpperCase(),
-        textAlign: isDesktop ? TextAlign.left : TextAlign.center,
-        maxLines: isDesktop ? 2 : 3,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(
-          color: Colors.white,
-          fontSize: 40,
-          fontFamily: 'RobotoCondensed',
-          fontWeight: FontWeight.w900,
-          letterSpacing: 1.0,
-          shadows: [Shadow(color: Colors.black, blurRadius: 10)],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildMiniBadge(
-    BuildContext context,
-    String label, {
-    bool isProvider = false,
-  }) {
-    final theme = Theme.of(context);
-    final color = isProvider
-        ? theme.colorScheme.primary
-        : theme.colorScheme.secondary;
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.1),
-        borderRadius: BorderRadius.circular(4),
-        border: Border.all(color: color.withValues(alpha: 0.5), width: 0.5),
-      ),
-      child: Text(
-        label,
-        style: theme.textTheme.labelSmall?.copyWith(
-          color: color,
-          fontSize: 8,
-          fontWeight: FontWeight.w900,
-          letterSpacing: 0.5,
-        ),
-      ),
+      errorWidget: (context, url, error) => const SizedBox.shrink(),
     );
   }
 }
