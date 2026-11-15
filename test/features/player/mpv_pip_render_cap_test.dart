@@ -1,7 +1,7 @@
-/// PiP render-cap decision (+35 P1): the PiP cap and the thermal cap
-/// share one actuation (the fork's `VideoController.setSize`), so the
-/// target is always the min of the two — either one wanting 1080p
-/// keeps 1080p; only both clear restores full size.
+/// PiP render-cap decision (+35 P1, +47 540p): the PiP cap and the
+/// thermal cap share one actuation (the fork's `VideoController.setSize`),
+/// so the target is always the min of the two — PiP up takes 540p,
+/// thermal alone 1080p; only both clear restores full size.
 library;
 
 import 'package:flutter_test/flutter_test.dart';
@@ -9,25 +9,25 @@ import 'package:skystream/features/player/presentation/mpv/mpv_pip_quality.dart'
 
 void main() {
   group('pipRenderCapTarget', () {
-    test('PiP up + 4K => 1080p', () {
+    test('PiP up + 4K => 540p', () {
       expect(
         pipRenderCapTarget(
           pipUp: true,
           thermalLightened: false,
           sourceHeight: 2160,
         ),
-        PipRenderCap.capped1080p,
+        PipRenderCap.capped540p,
       );
     });
 
-    test('PiP up + thermal lightened => 1080p (min of the two caps)', () {
+    test('PiP up + thermal lightened => 540p (min of the two caps)', () {
       expect(
         pipRenderCapTarget(
           pipUp: true,
           thermalLightened: true,
           sourceHeight: 2160,
         ),
-        PipRenderCap.capped1080p,
+        PipRenderCap.capped540p,
       );
     });
 

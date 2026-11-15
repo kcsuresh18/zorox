@@ -61,20 +61,27 @@ bool shouldAutoEnterPip({
   return true;
 }
 
-/// The render-cap target the PiP and thermal caps agree on (+35 P1).
+/// The render-cap target the PiP and thermal caps agree on (+35 P1,
+/// +47 PiP 540p).
 ///
 /// The PiP cap and the thermal cap share one actuation (the fork's
 /// `VideoController.setSize` — see `_setIosRenderCap` in
 /// `mpv_player_screen.dart`), so the target is always the min of the
-/// two: either one wanting 1080p keeps 1080p; only both clear restores
-/// full size. 960x540 is the later tuning step if the phone test
-/// still lags in PiP — it is deliberately NOT a variant here.
+/// two: PiP up takes 960x540 (the 22GB 4K file still lagged in the PiP
+/// window on the 1080p cap), thermal alone keeps 1080p; only both
+/// clear restores full size.
 enum PipRenderCap {
   /// Render at the source's native size.
   full,
 
   /// Cap the render target at 1920x1080.
   capped1080p,
+
+  /// Cap the render target at 960x540 (+47): the PiP cap. A quarter
+  /// of the 1080p cap's pixels (a sixteenth of 4K) — the feed is
+  /// ~640 px wide, so nothing visible is lost, and the in-app texture
+  /// is invisible while the app is backgrounded.
+  capped540p,
 }
 
 /// The render-cap target for the current PiP/thermal state (+35 P1).
@@ -90,6 +97,8 @@ PipRenderCap pipRenderCapTarget({
   required int sourceHeight,
 }) {
   if (sourceHeight <= 1080) return PipRenderCap.full;
-  if (pipUp || thermalLightened) return PipRenderCap.capped1080p;
+  // The min of the two caps: PiP takes 540p, thermal alone 1080p.
+  if (pipUp) return PipRenderCap.capped540p;
+  if (thermalLightened) return PipRenderCap.capped1080p;
   return PipRenderCap.full;
 }

@@ -1385,10 +1385,14 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
             // re-apply it now that the new stream's parameters are
             // known (first frame is playing).
             unawaited(_logMpvPlaybackStats('BASELINE'));
-            // +35 P1: the fork re-requests full size on a video-
-            // parameter change, so a source change while PiP is up
-            // would silently drop the PiP cap — re-apply it here too.
-            if (_thermalGovernor.isLightened || _pipRenderCapped) {
+            // +35 P1 (+47 540p): the fork re-requests full size on a
+            // video-parameter change, so a source change while PiP is
+            // up would silently drop the PiP cap — re-apply it here
+            // too. The PiP cap is 960x540, the thermal cap 1080p, so
+            // the two are re-applied at their own sizes.
+            if (_pipRenderCapped) {
+              unawaited(_setIosRenderCap(true, width: 960, height: 540));
+            } else if (_thermalGovernor.isLightened) {
               unawaited(_setIosRenderCap(true));
             }
             // The stats overlay (+34): the same values, live on screen
@@ -1926,16 +1930,18 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     return _streams[_streamIndex].quality;
   }
 
-  /// Applies the PiP render cap (+35 P1): while the iOS PiP window is
-  /// up the whole session runs on the software renderer, and a full
-  /// 4K SW render in the background under iOS CPU throttling cannot
-  /// keep up — so the render target drops to 1920x1080 (a quarter of
-  /// the pixels; the feed is ~640 px wide, so nothing visible is
-  /// lost). The decision is the pure [pipRenderCapTarget]: the PiP cap
-  /// and the thermal cap share one actuation ([_setIosRenderCap]), so
-  /// the target is the min of the two. No toast — the cap is not a
-  /// heat event. No-op when already capped or when the source is at
-  /// or below 1080p.
+  /// Applies the PiP render cap (+35 P1, +47 540p): while the iOS PiP
+  /// window is up the whole session runs on the software renderer, and
+  /// a full 4K SW render in the background under iOS CPU throttling
+  /// cannot keep up — so the render target drops to 960x540 (a
+  /// sixteenth of the pixels; the feed is ~640 px wide, so nothing
+  /// visible is lost, and the in-app texture is invisible while the
+  /// app is backgrounded). The 1080p cap (+39) was not enough for the
+  /// 22GB 4K file, which still lagged in the window. The decision is
+  /// the pure [pipRenderCapTarget]: the PiP cap and the thermal cap
+  /// share one actuation ([_setIosRenderCap]), so the target is the
+  /// min of the two. No toast — the cap is not a heat event. No-op
+  /// when already capped or when the source is at or below 1080p.
   Future<void> _applyPipRenderCap() async {
     if (_pipRenderCapped) return;
     final target = pipRenderCapTarget(
@@ -1943,15 +1949,15 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       thermalLightened: _thermalGovernor.isLightened,
       sourceHeight: _currentStreamHeight ?? 0,
     );
-    if (target != PipRenderCap.capped1080p) return;
-    if (await _setIosRenderCap(true)) {
+    if (target != PipRenderCap.capped540p) return;
+    if (await _setIosRenderCap(true, width: 960, height: 540)) {
       _pipRenderCapped = true;
     }
   }
 
-  /// Lifts the PiP render cap (+35 P1) now the window is down, and
-  /// restores the render target to the governor's desired state: if
-  /// the thermal governor is lightened the 1080p cap stays
+  /// Lifts the PiP render cap (+35 P1, +47 540p) now the window is
+  /// down, and restores the render target to the governor's desired
+  /// state: if the thermal governor is lightened the 1080p cap stays
   /// (re-applied — the PiP restore must never clobber a thermal
   /// lighten); otherwise full size returns. No-op when the PiP cap
   /// was never applied.
@@ -2043,22 +2049,28 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     }
   }
 
-  /// The iOS render cap (+34): caps the native render target at
-  /// 1920x1080 through the fork's `VideoController.setSize`, or restores
-  /// the native video-params size with a no-arg call. Returns whether
-  /// the cap actually applied. iOS only — the fork's Android controller
-  /// throws UnsupportedError for setSize, so this returns false there
-  /// without touching anything. A render cap is not a decode cap: the
-  /// phone still decodes the original 4K bitstream; the render target
-  /// is what shrinks, so the GPU has a quarter of the pixels to chew.
-  /// The fork re-requests the full size when the video parameters
-  /// change, so a source change while lightened re-applies the cap from
-  /// the first-play hook (see the `logMpvDecodeInfo` call site).
-  Future<bool> _setIosRenderCap(bool enabled) async {
+  /// The iOS render cap (+34, +47): caps the native render target
+  /// (1920x1080 by default, 960x540 for the PiP cap — see
+  /// [_applyPipRenderCap]) through the fork's `VideoController.setSize`,
+  /// or restores the native video-params size with a no-arg call.
+  /// Returns whether the cap actually applied. iOS only — the fork's
+  /// Android controller throws UnsupportedError for setSize, so this
+  /// returns false there without touching anything. A render cap is
+  /// not a decode cap: the phone still decodes the original 4K
+  /// bitstream; the render target is what shrinks, so the GPU has a
+  /// quarter of the pixels to chew (a sixteenth at 540p). The fork
+  /// re-requests the full size when the video parameters change, so a
+  /// source change while lightened re-applies the cap from the
+  /// first-play hook (see the `logMpvDecodeInfo` call site).
+  Future<bool> _setIosRenderCap(
+    bool enabled, {
+    int width = 1920,
+    int height = 1080,
+  }) async {
     if (defaultTargetPlatform != TargetPlatform.iOS) return false;
     try {
       if (enabled) {
-        await _videoController.setSize(width: 1920, height: 1080);
+        await _videoController.setSize(width: width, height: height);
       } else {
         await _videoController.setSize();
       }

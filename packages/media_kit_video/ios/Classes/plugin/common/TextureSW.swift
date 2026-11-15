@@ -26,14 +26,17 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
   // source TRC to sRGB right after mpv renders — both paths then show
   // the same colours, in the app and in the PiP window (which taps
   // this same buffer). Only TRCs that need it (bt.1886 and other pure
-  // powers above 2.2); bt.709/sRGB are left alone, and PQ (HDR) gets a
-  // BT.2390 tone map instead of a gamma fix (see pqToneMapLut, +46).
+  // powers above 2.2); bt.709/sRGB are left alone, and HDR gets a
+  // BT.2390 tone map instead of a gamma fix — PQ (see pqToneMapLut,
+  // +46) and HLG (see hlgToneMapLut, +47), each with its own decode.
   // The TRC is read once per video size from video-params/gamma;
   // unknown defaults to bt.1886, the TRC mpv itself guesses for SDR.
   private var swLutExponent: Double?
   /// +46: the file's peak luminance in nits while the PQ tone map is
   /// active (nil otherwise). Cached per video size next to the exponent.
   private var swLutPQPeak: Double?
+  /// +47: same, while the HLG tone map is active (nil otherwise).
+  private var swLutHLGPeak: Double?
   private var swLutSize: CGSize?
   private var swLut: [UInt8]?
   private static let swLutIdentity: [UInt8] = (0...255).map { UInt8($0) }
@@ -282,6 +285,36 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     return 1.055 * pow(l, 1.0 / 2.4) - 0.055
   }
 
+  /// BT.2390 EETF (Hermite highlight roll-off) on a PQ code, in the
+  /// +46 pqToneMapLut's normalised form: `code` is a PQ code value
+  /// (0..1), `masteringWhite` the PQ code of the source peak,
+  /// `maxLum` the display peak / source peak in PQ code words, `ks`
+  /// the knee. Returns the tone-mapped PQ code. Shared by the PQ LUT
+  /// and the HLG LUT (+47), so both HDR curves roll highlights off
+  /// identically.
+  private static func toneMapPQCode(
+    _ code: Double,
+    masteringWhite: Double,
+    maxLum: Double,
+    ks: Double
+  ) -> Double {
+    var p = code / masteringWhite
+    if p > 1.0 { p = 1.0 }
+    let p2: Double
+    if p <= ks || ks >= 1.0 {
+      p2 = p
+    } else {
+      let t = (p - ks) / (1.0 - ks)
+      let t2 = t * t
+      let t3 = t2 * t
+      p2 =
+        (2 * t3 - 3 * t2 + 1) * ks
+        + (t3 - 2 * t2 + t) * (1.0 - ks)
+        + (-2 * t3 + 3 * t2) * maxLum
+    }
+    return p2 * masteringWhite
+  }
+
   /// PQ (HDR) -> SDR tone-mapping LUT: per 8-bit PQ code, BT.2390 EETF
   /// in PQ space (verified against the reference curve: 100 nits in ->
   /// ~69 nits out, 1,000 nits in -> 100 nits out, for a 1,000-nit
@@ -292,8 +325,8 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
   /// and diffuse white stay bright; above it a Hermite spline rolls
   /// the highlights off onto the display peak. A naive linear
   /// scale-to-peak would darken diffuse white to ~35% grey instead.
-  /// HLG is not covered (different curve) — it still falls through to
-  /// no correction.
+  /// HLG has its own LUT (see hlgToneMapLut, +47) — same EETF,
+  /// different decode.
   private static func pqToneMapLut(peakNits: Double) -> [UInt8] {
     let masteringWhite = pqEncode(peakNits / 10000.0)
     guard masteringWhite > 0 else { return swLutIdentity }
@@ -302,21 +335,12 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     let ks = max(0.0, min(1.0, 1.5 * maxLum - 0.5))
     return (0...255).map { i in
       let code = Double(i) / 255.0
-      var p = code / masteringWhite
-      if p > 1.0 { p = 1.0 }
-      let p2: Double
-      if p <= ks || ks >= 1.0 {
-        p2 = p
-      } else {
-        let t = (p - ks) / (1.0 - ks)
-        let t2 = t * t
-        let t3 = t2 * t
-        p2 =
-          (2 * t3 - 3 * t2 + 1) * ks
-          + (t3 - 2 * t2 + t) * (1.0 - ks)
-          + (-2 * t3 + 3 * t2) * maxLum
-      }
-      let newCode = p2 * masteringWhite
+      let newCode = toneMapPQCode(
+        code,
+        masteringWhite: masteringWhite,
+        maxLum: maxLum,
+        ks: ks
+      )
       // Absolute PQ code -> linear light (1.0 = 10,000 nits) -> relative
       // to the 100-nit SDR white -> sRGB code value.
       let linear = pqEotf(newCode) / 0.01
@@ -325,12 +349,64 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     }
   }
 
+  // +47: HLG (ARIB STD-B67 / BT.2100) inverse OETF constants.
+  private static let hlgA = 0.17883277
+  private static let hlgB = 0.28466892
+  private static let hlgC = 0.55991073
+
+  /// HLG code value (0..1) -> scene-linear light (0..1). The OETF is
+  /// sqrt(3E) below the 0.5 breakpoint (E = 1/12) and a*ln(12E - b) + c
+  /// above it; the inverse mirrors both branches.
+  private static func hlgInverseOetf(_ ePrime: Double) -> Double {
+    if ePrime <= 0.5 {
+      return (ePrime * ePrime) / 3.0
+    }
+    return (exp((ePrime - hlgC) / hlgA) + hlgB) / 12.0
+  }
+
+  /// HLG (HDR) -> SDR tone-mapping LUT: per 8-bit HLG code, inverse
+  /// HLG OETF to scene-linear light, the reference HLG OOTF gamma
+  /// (1.2) to display-linear light, scale by the mastering peak, then
+  /// the same BT.2390 EETF as the PQ LUT (via toneMapPQCode — the
+  /// HLG-derived light is PQ-encoded first, so both HDR curves roll
+  /// highlights off identically) and sRGB-encode. HLG is
+  /// scene-referred where PQ is absolute, so it needs its own decode
+  /// — reusing the PQ LUT's code values directly would be wrong — but
+  /// the tone-mapping curve is shared. Verified numerically (see the
+  /// +47 report): black -> 0, HLG mid (0.5) -> ~182, diffuse white
+  /// (0.75) -> ~242, peak -> 255, monotonic.
+  private static func hlgToneMapLut(peakNits: Double) -> [UInt8] {
+    let masteringWhite = pqEncode(peakNits / 10000.0)
+    guard masteringWhite > 0 else { return swLutIdentity }
+    let displayWhite = pqEncode(0.01)  // 100 nits, the SDR white
+    let maxLum = min(1.0, displayWhite / masteringWhite)
+    let ks = max(0.0, min(1.0, 1.5 * maxLum - 0.5))
+    return (0...255).map { i in
+      let ePrime = Double(i) / 255.0
+      let sceneLinear = hlgInverseOetf(ePrime)
+      let displayLinear = pow(max(0.0, sceneLinear), 1.2)
+      let nits = displayLinear * peakNits
+      let code = pqEncode(min(1.0, max(0.0, nits / 10000.0)))
+      let newCode = toneMapPQCode(
+        code,
+        masteringWhite: masteringWhite,
+        maxLum: maxLum,
+        ks: ks
+      )
+      let linear = pqEotf(newCode) / 0.01
+      let s = srgbEncode(min(1.0, max(0.0, linear)))
+      return UInt8(max(0, min(255, (s * 255.0).rounded())))
+    }
+  }
+
   /// Maps the rendered frame's transfer function to sRGB, in place.
-  /// Two cases, decided once per video size: a pure-power TRC (bt.1886
-  /// and friends) gets a power LUT, and PQ (HDR) gets a BT.2390
-  /// tone-mapping LUT (see pqToneMapLut). A no-op (apart from the
-  /// property reads on the first frame of a new size) when the source is
-  /// already sRGB-like, or an HDR curve this does not cover (HLG).
+  /// Three cases, decided once per video size: a pure-power TRC
+  /// (bt.1886 and friends) gets a power LUT, PQ (HDR) gets a BT.2390
+  /// tone-mapping LUT (see pqToneMapLut), and HLG (HDR) gets its own
+  /// BT.2390 tone-mapping LUT (see hlgToneMapLut, +47). A no-op (apart
+  /// from the property reads on the first frame of a new size) when
+  /// the source is already sRGB-like, or an HDR/log curve this does
+  /// not cover.
   private func applySwGammaCorrection(
     size: CGSize,
     pitch: Int,
@@ -344,6 +420,7 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
       swLutSize = size
       swLutExponent = nil
       swLutPQPeak = nil
+      swLutHLGPeak = nil
       swLut = nil
     }
     if swLutExponent == nil {
@@ -351,6 +428,11 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
         // +46: HDR (PQ) — tone-map, don't gamma-correct. The exponent
         // stays 1.0 as the "decided" marker; the peak rides alongside.
         swLutPQPeak = readSigPeakNits()
+        swLutExponent = 1.0
+      } else if readVideoGammaName() == "hlg" {
+        // +47: HDR (HLG) — tone-map with its own LUT, don't
+        // gamma-correct. Same "decided" marker and peak as PQ.
+        swLutHLGPeak = readSigPeakNits()
         swLutExponent = 1.0
       } else {
         let source = readVideoGammaExponent()
@@ -360,6 +442,10 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     if let peak = swLutPQPeak {
       if swLut == nil {
         swLut = Self.pqToneMapLut(peakNits: peak)
+      }
+    } else if let hlgPeak = swLutHLGPeak {
+      if swLut == nil {
+        swLut = Self.hlgToneMapLut(peakNits: hlgPeak)
       }
     } else {
       guard let exponent = swLutExponent, exponent > 1.0 else { return }
