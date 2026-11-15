@@ -94,6 +94,40 @@ bool hwdecSessionLost({required String current}) {
   return !alive.contains(current.trim());
 }
 
+/// Whether the decoder needs a re-sync seek on app resume (+48).
+///
+/// iOS suspends the VideoToolbox decoder while the app is backgrounded,
+/// and its reference frames go stale — on resume the player restarts
+/// mid-GOP without a valid I-frame reference, so the picture is
+/// macroblocked (and sometimes frozen) until the next keyframe, ~2-4 s
+/// later (user proof 2026-11-16, Other Mommy 1080p, PiP OFF: full-frame
+/// macroblocking + wrong colours at 06:33-06:35, clean by 06:36). The
+/// +40 P4 restore cannot see it: it stands down while the player is
+/// paused (`!_playing` — media_kit does not auto-play on resume,
+/// `resumeUponEnteringForegroundMode` defaults to false), and even when
+/// it runs it stands down while the session is alive
+/// (`hwdec-current == videotoolbox`) — alive is not the same as
+/// in-sync. A seek to the current position forces mpv to flush the
+/// decoder and restart from the nearest keyframe (the stall watchdog's
+/// nudge, same move), so the first frame after play is clean.
+///
+/// Only when the player was actually background-paused: PiP keeps
+/// decoding (no pause, nothing stale), an open landing re-syncs on its
+/// own, and a film that never started has no position to seek to.
+/// Pure, so it is unit-tested (see `mpv_resume_resync_test.dart`).
+bool shouldResyncDecoderOnResume({
+  required bool pipEnabled,
+  required bool inPip,
+  required bool awaitingPrebuffer,
+  required bool startedPlaying,
+  required bool hasStream,
+}) =>
+    !pipEnabled &&
+    !inPip &&
+    !awaitingPrebuffer &&
+    startedPlaying &&
+    hasStream;
+
 /// Applies [kMpvIosOptions] to a player's mpv instance, then reads the
 /// fallback back so the log shows what was set. Same best-effort shape
 /// as [applyMpvAndroidOptions] in `mpv_android_options.dart`: a single

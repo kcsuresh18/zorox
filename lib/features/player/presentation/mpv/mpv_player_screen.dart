@@ -724,6 +724,7 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       // whether or not the activity got round to telling us. The window
       // is already gone by the time the app is foregrounded, so there is
       // no native stop to send — just take the chrome back.
+      final wasInPip = _inPip;
       if (_inPip) {
         _pipWatchdog?.cancel();
         _pipWatchdog = null;
@@ -736,6 +737,30 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       // live decoder and restore it when it is actually lost (see
       // [_restoreHwdecOnResume]) — never when it is healthy.
       unawaited(_restoreHwdecOnResume());
+      // +48: re-sync the decoder on return from Home (PiP OFF). iOS
+      // suspends VideoToolbox while backgrounded and its reference
+      // frames go stale, so the player restarts mid-GOP — macroblocked
+      // for a few seconds, sometimes frozen — until the next keyframe
+      // (user proof 2026-11-16, Other Mommy 1080p). P4 cannot see it
+      // (it stands down while paused and while the session is alive).
+      // A seek to the playhead forces mpv to flush the decoder and
+      // restart from the nearest keyframe (the stall watchdog's nudge,
+      // same move). iOS only, PiP OFF only: PiP keeps decoding, so
+      // there is nothing stale to re-sync. The seek does not change the
+      // pause state — a film paused before Home stays paused, and its
+      // first frame after play is clean.
+      if (defaultTargetPlatform == TargetPlatform.iOS &&
+          shouldResyncDecoderOnResume(
+            pipEnabled: _iosMpvPipEnabled,
+            inPip: wasInPip,
+            awaitingPrebuffer: _awaitingPrebuffer,
+            startedPlaying: _startedPlaying,
+            hasStream:
+                _streamIndex >= 0 && _streamIndex < _streams.length,
+          )) {
+        debugPrint('[mpv] resume re-sync: seeking to $_position');
+        unawaited(_player.seek(_position));
+      }
     }
     // A backstop behind the pause flush: the position at the moment the
     // app goes away is the one Continue Watching must have.
