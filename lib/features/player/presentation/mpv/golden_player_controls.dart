@@ -24,8 +24,10 @@
 ///   * vertical swipe on the RIGHT half changes the volume, on the LEFT
 ///     half the screen brightness — a full screen height is the whole
 ///     range. A small gold rail shows the level and fades after the swipe
-///     ends. A swipe that is clearly horizontal does nothing (the Golden
-///     player has no swipe-seek), and a pinch still zooms.
+///     ends. A horizontal swipe seeks (+43, the stock chrome's rule:
+///     90 s per full width): right forward, left back, a pill showing
+///     the target time while the finger is down, the seek landing on
+///     release. A pinch still zooms.
 ///
 /// Everything is wired to the real engine through the adapter: no
 /// placeholder buttons. No Cast button — mpv/media_kit has no cast in
@@ -85,15 +87,32 @@ double subtitleRaiseAfterSlide(double startRaise, double travel) {
       .toDouble();
 }
 
-/// The subtitle raise a horizontal swipe lands on: [dxShare] is the share
-/// of the screen's width the finger moved, rightward positive — a right
-/// swipe lifts the caption, a left swipe drops it (+26). A full screen of
-/// travel is the whole raise range, the same rule as the vertical slide.
-double subtitleRaiseAfterHorizontalSwipe(
-  double startRaise,
+/// The playhead a horizontal swipe-seek lands on (+43): [dxShare] is the
+/// share of the screen's width the finger moved, rightward positive.
+/// A full screen of travel is 90 s — the stock chrome's rule (see its
+/// _updateSwipeSeek in vlc_player_controls.dart), so a short swipe
+/// moves a little and a long swipe moves a lot, on a film of any
+/// length. Right seeks forward, left seeks back. Held to [0,
+/// duration]. Pure, so it is unit-tested.
+Duration swipeSeekTarget(
+  Duration start,
+  Duration duration,
   double dxShare,
 ) {
-  return subtitleRaiseAfterSlide(startRaise, dxShare);
+  if (duration <= Duration.zero) return start;
+  final targetMs = start.inMilliseconds + (dxShare * 90000).round();
+  if (targetMs <= 0) return Duration.zero;
+  if (targetMs >= duration.inMilliseconds) return duration;
+  return Duration(milliseconds: targetMs);
+}
+
+/// "2:36" / "1:04:12": the swipe-seek pill's time, the stock chrome's
+/// shape.
+String _formatDuration(Duration d) {
+  final h = d.inHours;
+  final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+  final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+  return h > 0 ? '$h:$m:$s' : '$m:$s';
 }
 
 /// The pinch zoom's range (v18): the picture never shrinks below half
@@ -259,6 +278,14 @@ class _GoldenPlayerControlsState
   bool _seeking = false;
   Duration _seekPreview = Duration.zero;
 
+  /// A horizontal swipe-seek in flight (+43), and the playhead it
+  /// counts from: the preview is measured from here, not accumulated,
+  /// so it can never drift. The seek itself lands on release (see
+  /// [_commitSwipeSeek]); a pinch mid-swipe cancels it instead (see
+  /// [_cancelSwipeSeek]).
+  bool _swipeSeeking = false;
+  Duration _swipeSeekStart = Duration.zero;
+
   /// Pinch state, for the zoom.
   bool _pinching = false;
   double _pinchStartScale = 1.0;
@@ -291,7 +318,7 @@ class _GoldenPlayerControlsState
   double _rawPinchStartScale = 1.0;
 
   // -- vertical swipe rails (volume right / brightness left / subtitles
-  // centre) + the horizontal subtitle swipe -------------------------------
+  // centre) + the horizontal swipe-seek -----------------------------------
   //
   // One scale recognizer owns the single-finger pan and the pinch together
   // (the stock chrome's shape): the axis is decided once, from the down
@@ -299,12 +326,11 @@ class _GoldenPlayerControlsState
   // mpv volume, left third = the screen brightness, through the same seam
   // the stock chrome uses ([PlatformPlayerBrightness]); the centre third
   // slides the subtitle up and down (+25). A clearly horizontal pan is
-  // the subtitle's sideways control instead (+26): right lifts the
-  // caption, left drops it, anywhere on the video — no other gesture
-  // uses a horizontal pan, so there is no zone to fight over. The thirds
-  // mirror the double-tap zones (outer thirds seek, centre toggles play),
-  // so a thumb already knows where it is. A pan is one axis or the other,
-  // never both, so the two subtitle swipes cannot fight each other.
+  // the swipe-seek instead (+43): right forward, left back, 90 s per
+  // full screen width — the stock chrome's rule — anywhere on the video,
+  // because no other gesture uses a horizontal pan. The subtitle keeps
+  // its centre-third vertical slide, so a pan is one axis or the other,
+  // never both, and the seek and the rails cannot fight each other.
   _GoldenPanAxis _panAxis = _GoldenPanAxis.none;
 
   /// The down point the pan's travel is measured from, landed by a
@@ -476,6 +502,7 @@ class _GoldenPlayerControlsState
       _pinching = false;
       _panAxis = _GoldenPanAxis.none;
       _railDragEnd();
+      _cancelSwipeSeek();
       _endSpeedBoost();
       _rawPinching = true;
       _rawPinchStartScale = widget.videoScale?.value ?? 1.0;
@@ -576,8 +603,9 @@ class _GoldenPlayerControlsState
     if (_suppressScale) return;
     // A stale pan from an end the framework never delivered — an
     // interrupted pointer — is cleared here, so the next gesture does not
-    // inherit a rail.
+    // inherit a rail or a swipe-seek.
     _railDragEnd();
+    _cancelSwipeSeek();
     _panAxis = _GoldenPanAxis.none;
     if (d.pointerCount >= 2) {
       _pinching = true;
@@ -610,11 +638,12 @@ class _GoldenPlayerControlsState
     if (d.pointerCount >= 2) {
       // A second finger landed mid-pan: the pan is cancelled, not
       // committed. A rail already applies live, so ending it is only
-      // hiding it on its clock.
+      // hiding it on its clock. A swipe-seek commits nothing either.
       if (!_pinching) {
         _pinching = true;
         _pinchStartScale = widget.videoScale?.value ?? 1.0;
         _railDragEnd();
+        _cancelSwipeSeek();
         _endSpeedBoost();
       }
       final notifier = widget.videoScale;
@@ -647,19 +676,22 @@ class _GoldenPlayerControlsState
         // each apply only their own.
         _updateRail(travel.dy);
       } else {
-        // The horizontal swipe is the subtitle's sideways control (+26):
-        // right lifts the caption, left drops it. Like the vertical rail,
-        // this update applies the whole travel since the down point in
-        // one go, and the updates that follow it each apply only their own.
-        _beginHorizontalSubtitleSwipe();
-        _updateSubtitleHorizontal(travel.dx);
+        // The horizontal swipe is the swipe-seek (+43): right forward,
+        // left back. Like the vertical rail, this update applies the
+        // whole travel since the down point in one go, and the updates
+        // that follow it each apply only their own.
+        _beginSwipeSeek();
+        _updateSwipeSeek(travel.dx);
       }
       return;
     }
     if (_panAxis == _GoldenPanAxis.vertical) {
       _updateRail(d.focalPointDelta.dy);
     } else if (_panAxis == _GoldenPanAxis.horizontal) {
-      _updateSubtitleHorizontal(d.focalPointDelta.dx);
+      // Measured from the anchor every time, never accumulated: the
+      // preview is absolute from the swipe's start.
+      final anchor = _panAnchor ?? d.focalPoint;
+      _updateSwipeSeek(d.focalPoint.dx - anchor.dx);
     }
   }
 
@@ -671,6 +703,7 @@ class _GoldenPlayerControlsState
       _pinching = true;
       _pinchStartScale = widget.videoScale?.value ?? 1.0;
       _railDragEnd();
+      _cancelSwipeSeek();
       _endSpeedBoost();
       _panAxis = _GoldenPanAxis.none;
       return;
@@ -693,44 +726,100 @@ class _GoldenPlayerControlsState
       _panAnchorLocalX = null;
       return;
     }
-    // The last pointer lifted: the pan commits. A rail in flight — the
-    // vertical slide or the horizontal subtitle swipe — hides on its
-    // clock; the axis stays horizontal or vertical for the gesture's
-    // life, so a rail can only be in flight on its own axis.
+    // The last pointer lifted: the pan commits. A rail in flight hides
+    // on its clock; a swipe-seek in flight lands on release. The axis
+    // stays horizontal or vertical for the gesture's life, so a rail
+    // can only be in flight on its own axis.
     if (_dragRail != null) {
       _railDragEnd();
+    }
+    if (_swipeSeeking) {
+      _commitSwipeSeek();
     }
     _panAxis = _GoldenPanAxis.none;
     _panAnchor = null;
     _panAnchorLocalX = null;
   }
 
-  /// Starts a horizontal subtitle swipe (+26): the swipe is the sideways
-  /// control for the caption's raise — right lifts, left drops — and it
-  /// runs anywhere on the video, because no other gesture uses a
-  /// horizontal pan. It is the subtitle rail, so the same indicator
-  /// shows the new raise live. The raise reads synchronously from the
-  /// settings, so there is nothing to wait for — unlike brightness,
-  /// which the vertical rail reads async.
-  void _beginHorizontalSubtitleSwipe() {
-    if (!_isTouch) return;
-    _dragId++;
-    _dragRail = _GoldenRailKind.subtitle;
-    _dragReady = true;
-    _dragPending = 0;
-    _dragStart = widget.settings.value.subtitleRaise;
+  /// Starts a horizontal swipe-seek (+43): the playhead the swipe
+  /// counts from, and the preview it shows. Only on touch, only when
+  /// the setting is on and the input is seekable — the stock chrome's
+  /// guards (see its _beginSwipeSeek). The preview is the seekbar's
+  /// own ([_seeking]/[_seekPreview]), so the bottom bar follows it
+  /// while the chrome is up, and the centre pill (see [build]) shows
+  /// it while the chrome is not.
+  void _beginSwipeSeek() {
+    if (!_isTouch ||
+        widget.isLive ||
+        !widget.settings.value.swipeSeekEnabled) {
+      return;
+    }
+    final value = widget.controller.value;
+    if (!value.isSeekable || value.duration <= Duration.zero) return;
+    _swipeSeeking = true;
+    _swipeSeekStart = value.position;
+    setState(() {
+      _seeking = true;
+      _seekPreview = value.position;
+    });
+    widget.chrome.poke(hold: true);
   }
 
-  /// Moves the caption's raise by a horizontal swipe: [dx] is the
-  /// finger's travel in logical pixels since the last update, rightward
-  /// positive. A full screen width of travel is the whole raise range —
-  /// the same rule as the vertical slide — so the swipe's feel matches
-  /// it. Right is up, left is down.
-  void _updateSubtitleHorizontal(double dx) {
-    if (_dragRail != _GoldenRailKind.subtitle) return;
+  /// Moves the swipe-seek's preview: [totalDx] is the finger's travel
+  /// in logical pixels since the down point, rightward positive —
+  /// measured from the anchor every time, never accumulated, so the
+  /// preview can never drift. Nothing is sought yet: the release does
+  /// that (see [_commitSwipeSeek]), so a swipe that becomes a pinch
+  /// commits nothing.
+  void _updateSwipeSeek(double totalDx) {
+    if (!_swipeSeeking) return;
     final width = context.size?.width ?? 0;
     if (width <= 0) return;
-    _railTravel(_GoldenRailKind.subtitle, dx / width);
+    final duration = widget.controller.value.duration;
+    if (duration <= Duration.zero) return;
+    final preview = swipeSeekTarget(
+      _swipeSeekStart,
+      duration,
+      totalDx / width,
+    );
+    if (preview != _seekPreview) {
+      setState(() => _seekPreview = preview);
+    }
+  }
+
+  /// Lands a swipe-seek on release: seeks to the preview, then lets
+  /// the chrome go. The seek is the controller's own, so a seek past
+  /// the end or before the start cannot happen — the preview was
+  /// already clamped there.
+  void _commitSwipeSeek() {
+    if (!_swipeSeeking) return;
+    _swipeSeeking = false;
+    final target = _seekPreview;
+    setState(() => _seeking = false);
+    widget.chrome.release();
+    unawaited(widget.controller.seekTo(target));
+    widget.chrome.keepAlive();
+  }
+
+  /// Drops a swipe-seek without seeking: a second finger turned the
+  /// gesture into a pinch, or a new gesture superseded a stale one the
+  /// framework never ended. The preview is discarded, so nothing jumps.
+  void _cancelSwipeSeek() {
+    if (!_swipeSeeking) return;
+    _swipeSeeking = false;
+    if (mounted) setState(() => _seeking = false);
+    widget.chrome.release();
+  }
+
+  /// The swipe-seek pill's text: the delta from where the swipe began
+  /// and the target time — "+62s (3:38)", the stock chrome's toast
+  /// shape — so the finger's travel reads at a glance.
+  String get _swipeSeekLabel {
+    final diffSeconds = (_seekPreview - _swipeSeekStart).inSeconds;
+    final target = _formatDuration(_seekPreview);
+    return diffSeconds < 0
+        ? '${diffSeconds}s ($target)'
+        : '+${diffSeconds}s ($target)';
   }
 
   /// Starts a vertical rail from the down point's third: brightness on the
@@ -805,9 +894,8 @@ class _GoldenPlayerControlsState
         // The subtitle slides on the same rule as the other rails: a full
         // screen of travel is the whole raise range. The raise is
         // persisted through the settings, so it survives reopening, and
-        // the Style tab's Position dropdown and both swipes — the
-        // centre-third vertical slide and the horizontal swipe — read
-        // the same value.
+        // the Style tab's Position dropdown and the centre-third
+        // vertical slide read the same value.
         final raise = subtitleRaiseAfterSlide(_dragStart, travel);
         _dragStart = raise;
         unawaited(widget.settingsNotifier.setSubtitleRaise(raise));
@@ -984,8 +1072,8 @@ class _GoldenPlayerControlsState
         // on the outer thirds and toggles play/pause in the centre
         // third, long-press (right half) holds 2x, pinch zooms,
         // vertical swipe rails volume (right) / brightness (left) /
-        // subtitle (centre), and a horizontal swipe moves the subtitle
-        // up to the right and down to the left.
+        // subtitle (centre), and a horizontal swipe seeks (right
+        // forward, left back, 90 s per full width).
         // Locked, only a bare tap and the outer-third double-tap seek
         // survive — the tap asks to see the unlock chip, the double-tap
         // skips ±10s; nothing else answers a finger.
@@ -1043,6 +1131,33 @@ class _GoldenPlayerControlsState
           value: _rail,
           builder: (context, data) => _GoldenRail(data: data),
         ),
+
+        // The swipe-seek preview (+43): the target time while a
+        // horizontal swipe is choosing where to land, as "+62s
+        // (3:38)", the stock chrome's toast shape. Over the video,
+        // chrome or not: the seekbar's own preview only shows while
+        // the chrome is up.
+        if (_swipeSeeking)
+          Center(
+            child: Container(
+              padding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 10,
+              ),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.65),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: Text(
+                _swipeSeekLabel,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ),
 
         // Buffering spinner, over the video, chrome or not.
         ValueListenableBuilder<VlcPlayerValue>(

@@ -1,11 +1,10 @@
-/// The subtitle's horizontal swipe (+26).
-///
-/// The −10/−5/+5/+10 pills are gone from the Subtitle style drawer's
-/// Position row; the swipe on the video is the adjustment now: right
-/// lifts the caption, left drops it, live, and the raise persists through
-/// the same [setSubtitleRaise] as the vertical slide and the Position
-/// dropdown. The centre-third vertical slide keeps working — a pan is
-/// one axis or the other, never both, so the two swipes cannot fight.
+/// The subtitle's horizontal swipe (+26) is gone: a horizontal swipe
+/// seeks now (+43), 90 s per full width like the stock chrome, with a
+/// pill showing the target time and the seek landing on release. The
+/// caption's raise is still adjustable — the centre-third vertical
+/// slide (+25) and the Subtitle style drawer's Position dropdown read
+/// the same [setSubtitleRaise], and the −10/−5/+5/+10 pills are still
+/// gone from the Position row.
 ///
 /// The duplicate cue the user reported in +25 could NOT be reproduced
 /// here — every one of the video's 196 frames at 30 fps shows the
@@ -41,51 +40,87 @@ import 'package:vlc_player/vlc_player.dart';
 import 'fake_vlc_engine.dart';
 
 void main() {
-  group('subtitleRaiseAfterHorizontalSwipe — right is up, left is down', () {
-    test('a right swipe of a tenth of the width adds a tenth of the range', () {
-      // A tenth of the width is a tenth of the 0.2 range: 0.02.
+  group('swipeSeekTarget — a full width is 90 s, like the stock chrome',
+      () {
+    test('a right swipe of a tenth of the width seeks 9 s forward', () {
       expect(
-        subtitleRaiseAfterHorizontalSwipe(0.1, 0.1),
-        closeTo(0.12, 0.0001),
-      );
-      expect(
-        subtitleRaiseAfterHorizontalSwipe(0.0, 0.5),
-        closeTo(0.1, 0.0001),
-      );
-    });
-
-    test('a left swipe of a tenth lowers it by the same', () {
-      expect(
-        subtitleRaiseAfterHorizontalSwipe(0.1, -0.1),
-        closeTo(0.08, 0.0001),
+        swipeSeekTarget(
+          const Duration(minutes: 2, seconds: 36),
+          const Duration(hours: 2),
+          0.1,
+        ),
+        const Duration(minutes: 2, seconds: 45),
       );
     });
 
-    test('a full screen right is the whole range', () {
-      expect(subtitleRaiseAfterHorizontalSwipe(0.0, 1.0), 0.2);
+    test('a left swipe of a tenth seeks 9 s back', () {
+      expect(
+        swipeSeekTarget(
+          const Duration(minutes: 2, seconds: 36),
+          const Duration(hours: 2),
+          -0.1,
+        ),
+        const Duration(minutes: 2, seconds: 27),
+      );
     });
 
-    test('a full screen left is the bottom', () {
-      expect(subtitleRaiseAfterHorizontalSwipe(0.2, -1.0), 0.0);
+    test('a full screen right is 90 s', () {
+      expect(
+        swipeSeekTarget(
+          const Duration(minutes: 2, seconds: 36),
+          const Duration(hours: 2),
+          1.0,
+        ),
+        const Duration(minutes: 4, seconds: 6),
+      );
     });
 
-    test('it clamps at both ends', () {
-      expect(subtitleRaiseAfterHorizontalSwipe(0.19, 0.1), 0.2);
-      expect(subtitleRaiseAfterHorizontalSwipe(0.01, -0.1), 0.0);
+    test('it clamps at the start and the end', () {
+      expect(
+        swipeSeekTarget(
+          const Duration(seconds: 5),
+          const Duration(hours: 2),
+          -1.0,
+        ),
+        Duration.zero,
+      );
+      expect(
+        swipeSeekTarget(
+          const Duration(hours: 1, minutes: 59, seconds: 30),
+          const Duration(hours: 2),
+          1.0,
+        ),
+        const Duration(hours: 2),
+      );
     });
 
     test('a small swipe moves a little, not a step', () {
-      // A 5% swipe is 0.01 of raise — smooth, not the old +5 pill's jump.
+      // A 5% swipe is 4.5 s — smooth, not a jump.
       expect(
-        subtitleRaiseAfterHorizontalSwipe(0.1, 0.05),
-        closeTo(0.11, 0.0001),
+        swipeSeekTarget(
+          const Duration(minutes: 2, seconds: 36),
+          const Duration(hours: 2),
+          0.05,
+        ),
+        const Duration(minutes: 2, seconds: 40, milliseconds: 500),
+      );
+    });
+
+    test('an unseekable duration returns the start', () {
+      expect(
+        swipeSeekTarget(
+          const Duration(minutes: 2),
+          Duration.zero,
+          1.0,
+        ),
+        const Duration(minutes: 2),
       );
     });
   });
 
-  group('the swipe lands in the rendered caption', () {
-    test('swiping right from Bottom lifts the padding', () {
-      final raise = subtitleRaiseAfterHorizontalSwipe(0.0, 0.5);
+  group('the vertical slide still lands in the rendered caption', () {
+    test('sliding up from Bottom lifts the padding', () {
+      final raise = subtitleRaiseAfterSlide(0.0, 0.5);
       final config = mpvSubtitleViewConfiguration(
         PlayerSettings(subtitleRaise: raise),
         screenHeight: 360,
@@ -94,8 +129,8 @@ void main() {
       expect(config.padding.bottom, 16.0 + 0.1 * 360);
     });
 
-    test('swiping left from Top drops it', () {
-      final raise = subtitleRaiseAfterHorizontalSwipe(0.2, -0.5);
+    test('sliding down from Top drops it', () {
+      final raise = subtitleRaiseAfterSlide(0.2, -0.5);
       final config = mpvSubtitleViewConfiguration(
         PlayerSettings(subtitleRaise: raise),
         screenHeight: 360,
@@ -104,11 +139,11 @@ void main() {
       expect(config.padding.bottom, 16.0 + 0.1 * 360);
     });
 
-    test('the base stays 16px after a swipe — the swipe only moves the raise',
+    test('the base stays 16px after a slide — the slide only moves the raise',
         () {
       final config = mpvSubtitleViewConfiguration(
         PlayerSettings(
-          subtitleRaise: subtitleRaiseAfterHorizontalSwipe(0.0, 0.25),
+          subtitleRaise: subtitleRaiseAfterSlide(0.0, 0.25),
         ),
         screenHeight: 360,
         controlsVisible: false,
@@ -148,9 +183,9 @@ void main() {
       if (dir.existsSync()) dir.deleteSync(recursive: true);
     });
 
-    test('setSubtitleRaise — the swipe\'s write — sticks', () async {
+    test('setSubtitleRaise — the vertical slide\'s write — sticks', () async {
       await container.read(playerSettingsProvider.future);
-      // What the horizontal swipe writes on every update.
+      // What the vertical slide writes on every update.
       await container
           .read(playerSettingsProvider.notifier)
           .setSubtitleRaise(0.13);

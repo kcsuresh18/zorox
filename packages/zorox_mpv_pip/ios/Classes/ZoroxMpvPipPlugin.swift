@@ -477,7 +477,7 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     // clock stops, on resume it re-syncs to host-now and runs again.
     // The movie position is irrelevant to the layer once the PTS is
     // host-clocked (see enqueue()); the PiP scrubber reads the
-    // timeRange delegate, not this clock.
+    // timeRange delegate, which is anchored to this clock (+43).
     if let tb = timebase, playing != lastAppliedPlaying {
       if playing {
         CMTimebaseSetTime(
@@ -1391,12 +1391,36 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     !playing
   }
 
+  /// The clock the PiP scrubber reads (+43): the display layer's
+  /// controlTimebase, which runs on the host clock — or the host clock
+  /// itself before the timebase exists. The timebase is frozen while
+  /// paused, so this holds still then and ticks at rate 1 while
+  /// playing.
+  private func pipClockNow() -> CMTime {
+    if let tb = timebase {
+      return CMTimebaseGetTime(tb)
+    }
+    return CMClockGetTime(CMClockGetHostTimeClock())
+  }
+
   public func pictureInPictureControllerTimeRangeForPlayback(
     _ controller: AVPictureInPictureController
   ) -> CMTimeRange {
     if duration > 0 && duration.isFinite {
+      // +43: the scrubber's position is the layer's timebase time
+      // mapped into this range — and the timebase runs on the HOST
+      // clock (~800M s since 2001), not the movie clock. A range
+      // starting at zero put every timebase reading far past its end,
+      // so the bar clamped to full whatever had played. Anchor the
+      // range to the timebase's now, minus the playhead: the bar then
+      // reads position/duration, advances with the timebase while
+      // playing, and holds still while paused.
+      let now = pipClockNow()
       return CMTimeRange(
-        start: .zero,
+        start: CMTime(
+          seconds: now.seconds - lastPosition,
+          preferredTimescale: 1000
+        ),
         duration: CMTime(seconds: duration, preferredTimescale: 1000)
       )
     }
@@ -1431,9 +1455,16 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     timeToSeekTo time: CMTime,
     completion completionHandler: @escaping (Bool) -> Void
   ) {
+    // +43: the range is anchored to the layer timebase (see
+    // pictureInPictureControllerTimeRangeForPlayback), so the time
+    // handed back is a host-clock time, not a movie position. The
+    // movie position it means is the time minus the range's start;
+    // the skip is that position minus where playback is now — which
+    // is just the time minus the timebase's now.
+    let now = pipClockNow()
     channel.invokeMethod(
       "pipSkip",
-      arguments: Int(time.seconds - lastPosition)
+      arguments: Int(time.seconds - now.seconds)
     )
     completionHandler(true)
   }

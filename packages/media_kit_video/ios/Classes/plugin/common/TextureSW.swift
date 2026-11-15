@@ -3,6 +3,7 @@
 #elseif canImport(FlutterMacOS)
   import FlutterMacOS
 #endif
+import Accelerate
 
 public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
   public typealias UpdateCallback = () -> Void
@@ -14,6 +15,24 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     objects: [],
     skipCheckArgs: true
   )
+
+  // +43 (ZoroX): the software renderer's gamma. mpv's SW backend
+  // (libswscale, mpv 0.36 as bundled by media_kit_libs_ios_video
+  // 1.1.4) expands the limited range correctly but never converts the
+  // transfer function, so this buffer holds bt.1886-encoded values
+  // for most films; the hardware path's gl_video converts to the sRGB
+  // the display assumes, so the same frame looked faded here (lifted
+  // shadows, grey veil) and right there. A per-channel LUT maps the
+  // source TRC to sRGB right after mpv renders — both paths then show
+  // the same colours, in the app and in the PiP window (which taps
+  // this same buffer). Only TRCs that need it (bt.1886 and other pure
+  // powers above 2.2); bt.709/sRGB/HDR are left alone. The TRC is read
+  // once per video size from video-params/gamma; unknown defaults to
+  // bt.1886, the TRC mpv itself guesses for SDR.
+  private var swLutExponent: Double?
+  private var swLutSize: CGSize?
+  private var swLut: [UInt8]?
+  private static let swLutIdentity: [UInt8] = (0...255).map { UInt8($0) }
 
   init(
     handle: OpaquePointer,
@@ -155,6 +174,16 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
       ) / 1_000_000
     ZoroXMpvRenderStats.shared.noteRender(durationMs: renderMs)
 
+    // +43: correct the SW path's gamma (see applySwGammaCorrection):
+    // mpv writes the video's own transfer function into this buffer
+    // while the hardware path hands Flutter sRGB values, so without
+    // this the same frame looks faded here and right there.
+    applySwGammaCorrection(
+      size: size,
+      pitch: pitch,
+      buffer: bufferPtr
+    )
+
     textureContexts.pushAsReady(textureContext!)
 
     // ZoroX fork: export the completed frame for the iOS mpv PiP plugin
@@ -167,5 +196,78 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
       object: textureContext!.pixelBuffer,
       userInfo: ZoroXMpvRenderStats.shared.snapshot()
     )
+  }
+
+  /// The video's transfer function as a pure power (bt.1886 -> 2.4),
+  /// or 2.4 when mpv cannot say (no video yet, or an untagged file —
+  /// mpv guesses bt.1886 for SDR itself).
+  private func readVideoGammaExponent() -> Double {
+    guard
+      let cStr = mpv_get_property_string(handle, "video-params/gamma")
+    else { return 2.4 }
+    defer { mpv_free(cStr) }
+    switch String(cString: cStr) {
+    case "bt.1886", "gamma2.4":
+      return 2.4
+    case "gamma2.6":
+      return 2.6
+    case "gamma2.8":
+      return 2.8
+    default:
+      // bt.709, srgb, gamma2.2 and every HDR/log curve: no correction
+      // (2.2 makes the LUT an identity, so it is skipped below).
+      return 2.2
+    }
+  }
+
+  /// Maps the rendered frame's transfer function to sRGB, in place.
+  /// A no-op (apart from one property read per new video size) when
+  /// the source is already sRGB-like or HDR.
+  private func applySwGammaCorrection(
+    size: CGSize,
+    pitch: Int,
+    buffer: UnsafeMutablePointer<UInt8>
+  ) {
+    let width = Int(size.width)
+    let height = Int(size.height)
+    if width <= 0 || height <= 0 || pitch <= 0 { return }
+    // A new size is a new video, which may carry a different TRC.
+    if swLutSize != size {
+      swLutSize = size
+      swLutExponent = nil
+      swLut = nil
+    }
+    if swLutExponent == nil {
+      let source = readVideoGammaExponent()
+      swLutExponent = source > 2.21 ? source / 2.2 : 1.0
+    }
+    guard let exponent = swLutExponent, exponent > 1.0 else { return }
+    if swLut == nil {
+      swLut = (0...255).map { i in
+        let v = pow(Double(i) / 255.0, exponent)
+        return UInt8(max(0, min(255, (v * 255.0).rounded())))
+      }
+    }
+    guard let lut = swLut else { return }
+    lut.withUnsafeBufferPointer { lutPtr in
+      Self.swLutIdentity.withUnsafeBufferPointer { idPtr in
+        var src = vImage_Buffer(
+          data: buffer,
+          height: vImagePixelCount(height),
+          width: vImagePixelCount(width),
+          rowBytes: pitch
+        )
+        var dst = src
+        _ = vImageTableLookUp_ARGB8888(
+          &src,
+          &dst,
+          lutPtr.baseAddress,
+          lutPtr.baseAddress,
+          lutPtr.baseAddress,
+          idPtr.baseAddress,
+          kvImageNoFlags
+        )
+      }
+    }
   }
 }
