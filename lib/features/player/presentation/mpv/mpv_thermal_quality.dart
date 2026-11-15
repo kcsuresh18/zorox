@@ -67,6 +67,34 @@ class ThermalQualityDecision {
   bool get isNone => kind == ThermalQualityKind.none;
 }
 
+/// The best lighter stream: the tallest one at or below [maxHeight],
+/// or — when no stream is that light — the tallest one below
+/// [currentHeight]. Null when nothing is lighter. Shared by the
+/// thermal governor and the PiP quality drop (+31): both walk the same
+/// ladder, only the ceiling differs (1080p for heat, 480p for PiP).
+int? bestLighterStreamIndex(
+  List<int?> qualities,
+  int currentHeight,
+  int maxHeight,
+) {
+  int? bestBelow;
+  int? bestLight;
+  for (var i = 0; i < qualities.length; i++) {
+    final quality = qualities[i];
+    if (quality == null || quality <= 0 || quality >= currentHeight) {
+      continue;
+    }
+    if (bestBelow == null || quality > qualities[bestBelow]!) {
+      bestBelow = i;
+    }
+    if (quality <= maxHeight &&
+        (bestLight == null || quality > qualities[bestLight]!)) {
+      bestLight = i;
+    }
+  }
+  return bestLight ?? bestBelow;
+}
+
 /// Decides, per tick, whether the phone's heat wants a quality change.
 ///
 /// Fed the OS thermal state, every stream's height (`null` or `0` for an
@@ -185,27 +213,9 @@ class ThermalQualityGovernor {
     return ThermalQualityDecision.drop(target);
   }
 
-  /// The best lighter stream: the tallest one at or below the drop
-  /// height, or — when no stream is that light — the tallest one below
-  /// the current height. Null when nothing is lighter.
-  int? _bestLighterIndex(List<int?> qualities, int currentHeight) {
-    int? bestBelow;
-    int? bestLight;
-    for (var i = 0; i < qualities.length; i++) {
-      final quality = qualities[i];
-      if (quality == null || quality <= 0 || quality >= currentHeight) {
-        continue;
-      }
-      if (bestBelow == null || quality > qualities[bestBelow]!) {
-        bestBelow = i;
-      }
-      if (quality <= dropAboveHeight &&
-          (bestLight == null || quality > qualities[bestLight]!)) {
-        bestLight = i;
-      }
-    }
-    return bestLight ?? bestBelow;
-  }
+  /// The best lighter stream for the governor's ceiling.
+  int? _bestLighterIndex(List<int?> qualities, int currentHeight) =>
+      bestLighterStreamIndex(qualities, currentHeight, dropAboveHeight);
 
   void _clearDrop() {
     _droppedFrom = null;

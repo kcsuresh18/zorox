@@ -140,8 +140,11 @@ class MpvPipIos {
   }
 
   /// Native diagnostic string for a PiP failure: layer status, whether the
-  /// layer is in a window, whether PiP is possible, the audio category,
-  /// and how many frames the tap has delivered.
+  /// layer is in a window, whether PiP is possible, the gate state
+  /// (`pipActive`), the audio category, how many frames the tap has
+  /// delivered (`ingest`), and the live-feed throughput while PiP is up
+  /// (`liveEnq` / `liveDrop` / `liveAgeMs`, +31) — plus the prime state
+  /// (`primed` / `primeAgeMs` / `primes`).
   Future<String> get diag async {
     if (defaultTargetPlatform != TargetPlatform.iOS) return 'not iOS';
     try {

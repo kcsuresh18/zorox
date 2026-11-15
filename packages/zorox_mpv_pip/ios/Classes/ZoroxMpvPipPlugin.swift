@@ -78,6 +78,33 @@ private final class PipHostView: UIView {
 /// through. So the layer stays empty in-app and is primed only when
 /// a start is imminent.
 ///
+/// +31: the +30 phone test shows PiP OPENS (prime works, window proper
+/// 16:9) but the picture runs at ~1 frame per 5 seconds and the voice
+/// stutters too — the whole mpv pipeline is starved in background, not
+/// just the video gate. The gate IS open (frames do arrive, slowly:
+/// willStart fired, proven by the burned-in subtitle, which mpv only
+/// renders once the Dart side turns sub-visibility on at PiP start),
+/// and the layer is NOT flushed (the "black window" reading was a dark
+/// anime scene — do not chase the flush theory). The cause is per-frame
+/// CPU on threads iOS throttles hard once backgrounded: the software
+/// renderer writes a full-res 1080p frame, ingest() vImage-downscales
+/// it, and enqueue() builds a fresh CMVideoFormatDescription per frame
+/// — while the same throttling starves mpv's audio decoder, hence the
+/// cut-cut voice. Fixes, in order of effect:
+/// (1) the Dart side drops to a <=480p source while PiP is up (the
+/// +27 thermal governor's ladder, reused) and restores on stop — a
+/// 1080p render+downscale is ~5x the work of a 480p one, at the
+/// source, where it counts; (2) enqueue() caches the format
+/// description per dimensions instead of creating one per frame;
+/// (3) ingest() drops a live frame early when the layer's queue is
+/// full, instead of paying the downscale for a frame the layer would
+/// refuse; (4) the gate is also opened in enter() right after
+/// startPictureInPicture() (the delegate still sets it; a failed start
+/// clears it), so the live feed no longer depends on the callback
+/// alone; (5) diag() now counts tap arrivals and live enqueues/drops
+/// with the last live frame's age, so the next phone test can tell
+/// "gate closed" from "no frames" from "frames too slow".
+///
 /// Own channel `dev.akash.skystream.player/pip_mpv_ios` — deliberately NOT
 /// `dev.akash.skystream.player/pip`, which the libVLC side already uses;
 /// reusing that name would replace its handler.
@@ -124,6 +151,24 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     label: "dev.akash.skystream.pip.frame"
   )
   private var frameCount = 0
+
+  // +31: throughput counters for diag() — how many frames the tap
+  // delivered, how many reached the layer while PiP was up, how many
+  // were dropped, and when the last live frame landed. Guarded by
+  // `lock`: ingest() runs on the media_kit render thread, enqueue()
+  // on the frame queue, diag() on the main thread.
+  private var ingestCount = 0
+  private var liveEnqueued = 0
+  private var liveDropped = 0
+  private var lastLiveEnqueueAt: CFAbsoluteTime = 0
+
+  // +31: the format description for the feed's dimensions, cached so
+  // enqueue() does not build one per frame (CoreMedia work on the
+  // throttled background feed thread). All frames in a session share
+  // dimensions and pixel format; a dimension change rebuilds it.
+  private var cachedFormatDesc: CMVideoFormatDescription?
+  private var cachedFormatW = 0
+  private var cachedFormatH = 0
 
   // MARK: - Prime (+30)
   //
@@ -404,6 +449,14 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     if pip.isPictureInPicturePossible {
       syncLayerFrame()
       pip.startPictureInPicture()
+      // +31: open the gate here too, not only in willStart — the start
+      // was accepted (possible was true), so the live feed must flow
+      // from now on even if the delegate callback is delayed or lost.
+      // A failed start clears it again (failedToStart -> stopPipFeed),
+      // as does a stop, so a refusal cannot leave the gate open.
+      lock.lock()
+      pipActive = true
+      lock.unlock()
       finishEnter(result: result, success: true)
       return
     }
@@ -519,6 +572,13 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     primeW = 0
     primeH = 0
     enterPending = false
+    ingestCount = 0
+    liveEnqueued = 0
+    liveDropped = 0
+    lastLiveEnqueueAt = 0
+    cachedFormatDesc = nil
+    cachedFormatW = 0
+    cachedFormatH = 0
     lock.unlock()
   }
 
@@ -544,6 +604,13 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   /// means no frame ever arrived (renderer tap broken); primed=true
   /// with possible=false means the layer saw the prime but the
   /// controller still refuses.
+  /// +31: also the gate state and the live-feed throughput — frames
+  /// the tap delivered (ingest), frames enqueued while PiP was up
+  /// (liveEnq), frames dropped while up (liveDrop), and the age of
+  /// the last live frame (liveAgeMs). A slow PiP reads as liveAgeMs
+  /// in the seconds (the +30 phone test: ~5000 ms) while pipActive
+  /// is true; a closed gate reads as pipActive=false with liveEnq
+  /// stuck at 0.
   private func diag() -> String {
     lock.lock()
     let pReady = primeReady
@@ -551,12 +618,22 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       ? Int((CFAbsoluteTimeGetCurrent() - primeUpdatedAt) * 1000)
       : -1
     let pCount = primeCount
+    let gate = pipActive
+    let ingested = ingestCount
+    let enqueued = liveEnqueued
+    let dropped = liveDropped
+    let liveAgeMs = lastLiveEnqueueAt > 0
+      ? Int((CFAbsoluteTimeGetCurrent() - lastLiveEnqueueAt) * 1000)
+      : -1
     lock.unlock()
     return "layer=\(layer?.status.rawValue ?? -1) "
       + "inWindow=\(hostView?.window != nil) "
       + "possible=\(pip?.isPictureInPicturePossible ?? false) "
+      + "pipActive=\(gate) "
       + "audio=\(AVAudioSession.sharedInstance().category.rawValue) "
       + "frames=\(frameCount) "
+      + "ingest=\(ingested) liveEnq=\(enqueued) liveDrop=\(dropped) "
+      + "liveAgeMs=\(liveAgeMs) "
       + "primed=\(pReady) primeAgeMs=\(pAgeMs) primes=\(pCount)"
   }
 
@@ -567,6 +644,7 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     let isArmed = armed
     let isPipActive = pipActive
     let targetLayer = layer
+    ingestCount += 1
     lock.unlock()
     guard isArmed, let layer = targetLayer else { return }
 
@@ -596,10 +674,20 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     // enqueued, so the layer stays empty in-app and a start always
     // has a fresh frame to push.
     if isPipActive {
-      guard let dst = makeBuffer(tw, th) else { return }
+      // +31: drop early when the layer's queue is full — the copy for
+      // a frame the layer would refuse is wasted CPU on the throttled
+      // background render thread, and the layer already holds frames.
+      if !layer.isReadyForMoreMediaData {
+        noteLiveDrop()
+        return
+      }
+      guard let dst = makeBuffer(tw, th) else {
+        noteLiveDrop()
+        return
+      }
       copyFrame(src: pb, dst: dst)
       frameQueue.async { [weak self] in
-        self?.enqueue(dst, on: layer)
+        self?.enqueue(dst, on: layer, live: true)
       }
       return
     }
@@ -777,18 +865,60 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     ) == kCVReturnSuccess ? out : nil
   }
 
-  private func enqueue(_ pb: CVPixelBuffer, on layer: AVSampleBufferDisplayLayer) {
-    if layer.status == .failed { layer.flush() }
-    // Drop rather than queue up: a backlog would show stale frames and
-    // grow without bound while the renderer is not ready.
-    guard layer.isReadyForMoreMediaData else { return }
+  /// One dropped live frame, for diag(). A live frame is one enqueued
+  /// while PiP is up; primes are not counted here.
+  private func noteLiveDrop() {
+    lock.lock()
+    liveDropped += 1
+    lock.unlock()
+  }
+
+  /// The format description for a frame's dimensions, cached (+31):
+  /// every frame in a session shares dimensions and pixel format, and
+  /// creating one per frame is CoreMedia work on the throttled
+  /// background feed thread. A dimension change (e.g. a quality
+  /// switch) rebuilds it. Format descriptions are immutable and safe
+  /// to share across the sample buffers built from them.
+  private func formatDescription(for pb: CVPixelBuffer) -> CMVideoFormatDescription? {
+    let w = CVPixelBufferGetWidth(pb)
+    let h = CVPixelBufferGetHeight(pb)
+    lock.lock()
+    if let cached = cachedFormatDesc, cachedFormatW == w, cachedFormatH == h {
+      lock.unlock()
+      return cached
+    }
+    lock.unlock()
     var fmt: CMVideoFormatDescription?
     CMVideoFormatDescriptionCreateForImageBuffer(
       allocator: kCFAllocatorDefault,
       imageBuffer: pb,
       formatDescriptionOut: &fmt
     )
-    guard let fd = fmt else { return }
+    guard let fd = fmt else { return nil }
+    lock.lock()
+    cachedFormatDesc = fd
+    cachedFormatW = w
+    cachedFormatH = h
+    lock.unlock()
+    return fd
+  }
+
+  private func enqueue(
+    _ pb: CVPixelBuffer,
+    on layer: AVSampleBufferDisplayLayer,
+    live: Bool = false
+  ) {
+    if layer.status == .failed { layer.flush() }
+    // Drop rather than queue up: a backlog would show stale frames and
+    // grow without bound while the renderer is not ready.
+    guard layer.isReadyForMoreMediaData else {
+      if live { noteLiveDrop() }
+      return
+    }
+    guard let fd = formatDescription(for: pb) else {
+      if live { noteLiveDrop() }
+      return
+    }
     var timing = CMSampleTimingInfo(
       duration: .invalid,
       presentationTimeStamp: CMTime(
@@ -805,7 +935,10 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       sampleTiming: &timing,
       sampleBufferOut: &sb
     )
-    guard st == noErr, let s = sb else { return }
+    guard st == noErr, let s = sb else {
+      if live { noteLiveDrop() }
+      return
+    }
     // mpv already timed the display; without this, frames judged late
     // are dropped silently — the classic black or frozen PiP.
     // The dictionaries returned by CMSampleBufferGetSampleAttachmentsArray
@@ -827,6 +960,12 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     }
     layer.enqueue(s)
     frameCount += 1
+    if live {
+      lock.lock()
+      liveEnqueued += 1
+      lastLiveEnqueueAt = CFAbsoluteTimeGetCurrent()
+      lock.unlock()
+    }
   }
 
   // MARK: - AVPictureInPictureControllerDelegate

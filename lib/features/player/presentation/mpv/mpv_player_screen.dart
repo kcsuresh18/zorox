@@ -96,6 +96,7 @@ import '../vlc/player_startup_view.dart';
 import 'golden_player_controls.dart';
 import 'mpv_android_options.dart';
 import 'mpv_ios_options.dart';
+import 'mpv_pip_quality.dart';
 import 'mpv_subtitle_style.dart';
 import 'mpv_thermal_quality.dart';
 import 'mpv_vlc_controller.dart';
@@ -354,6 +355,16 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// change. Pure — the screen acts on its decision.
   final ThermalQualityGovernor _thermalGovernor = ThermalQualityGovernor();
 
+  /// The stream that was playing when iOS PiP started, when the PiP
+  /// quality drop (+31) moved to a lighter one. Null when no drop is
+  /// in effect: either PiP is not up, the stream was already light,
+  /// or there was no lighter stream. Restored on PiP stop (see
+  /// `_restoreQualityAfterPip`). Kept apart from the thermal
+  /// governor's own drop state — the two drops are independent, and
+  /// the thermal watch stands down while PiP is up (see
+  /// `_onThermalTick`), so neither can cancel the other's episode.
+  int? _pipDroppedFrom;
+
   /// Where the open source started (its resume point, else zero): the
   /// pre-buffer cushion is measured from here, not from the stream start.
   Duration _openStart = Duration.zero;
@@ -445,6 +456,15 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// request, the chrome comes back after 5 s instead of staying hidden
   /// forever (mirrors the VLC screen).
   Timer? _pipWatchdog;
+
+  /// The iOS mpv PiP diag log (+31): while the PiP window is up, a tick
+  /// every 5 s that logs the native `diag()` — gate state and live-feed
+  /// throughput (ingest / liveEnq / liveDrop / liveAgeMs) — so the next
+  /// phone test's console can tell "gate closed" from "no frames" from
+  /// "frames too slow". debugPrint only; cancelled on PiP stop and in
+  /// dispose. Best-effort: if the isolate is suspended in background
+  /// the timer simply does not fire.
+  Timer? _pipDiagTimer;
   int _pipAttempt = 0;
   bool _pipWindowOpened = false;
   bool _pipAttemptFromButton = false;
@@ -557,6 +577,7 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     _stallTimer?.cancel();
     _thermalTimer?.cancel();
     _pipWatchdog?.cancel();
+    _pipDiagTimer?.cancel();
     // The native side remembers the last synced playing state (see the
     // playing listener): clear it now, or a film left playing would make
     // MainActivity open a PiP window for a player that no longer exists
@@ -859,11 +880,22 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       _pipWatchdog?.cancel();
       _pipWatchdog = null;
       unawaited(_enableMpvSubtitlesForPip());
+      // +31: the PiP quality drop — a light stream while the window is
+      // up, so the backgrounded render keeps up (see
+      // `_dropQualityForPip`). And the diag log, so the console shows
+      // the live-feed throughput while PiP runs.
+      _dropQualityForPip();
+      _startPipDiagLog();
       if (!_inPip) setState(() => _inPip = true);
     };
     pip.onPipStopped = (restored) {
       if (!mounted || _disposed) return;
       unawaited(_restoreMpvSubtitlesAfterPip());
+      _pipDiagTimer?.cancel();
+      _pipDiagTimer = null;
+      // +31: back to the stream PiP started on (see
+      // `_restoreQualityAfterPip`).
+      _restoreQualityAfterPip();
       _pipWatchdog?.cancel();
       _pipWatchdog = null;
       if (_inPip) setState(() => _inPip = false);
@@ -955,6 +987,69 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     } catch (_) {
       // Best-effort: the overlay is the subtitle display anyway.
     }
+  }
+
+  /// Drops to a light stream while the iOS PiP window is up (+31).
+  ///
+  /// The +30 phone test: PiP opens but the picture runs at ~1 frame
+  /// per 5 s and the voice stutters — the app is backgrounded, iOS
+  /// throttles its CPU hard, and the software renderer writing
+  /// full-res frames plus the tap's downscale cannot keep up (the
+  /// same throttling starves mpv's audio decoder, hence the voice).
+  /// The fix is to cut the work at the source: the tallest stream at
+  /// or below 480p (see `pipQualityDropTarget`), re-opened at the
+  /// playhead by the same [_pickSource] a tap on a source row makes.
+  /// The PiP window is small, so 480p is plenty, and the original
+  /// stream comes back on PiP stop (see `_restoreQualityAfterPip`).
+  /// No-op when there is nothing to drop to (already light, an HLS
+  /// master with no ladder, or no lighter stream) or when a drop is
+  /// already in effect. The drop is the screen's own state
+  /// ([_pipDroppedFrom]), not the thermal governor's: the thermal
+  /// watch stands down while PiP is up (see `_onThermalTick`), so
+  /// the two drops never fight.
+  void _dropQualityForPip() {
+    if (_disposed || _pipDroppedFrom != null) return;
+    final target = pipQualityDropTarget(
+      qualities: _streams.map((stream) => stream.quality).toList(),
+      currentIndex: _streamIndex,
+    );
+    if (target == null) return;
+    _pipDroppedFrom = _streamIndex;
+    ref.read(notificationServiceProvider).showInfo(
+      'Picture-in-picture — switched to '
+      '${_thermalTargetLabel(target)} for smooth playback',
+      title: 'Picture-in-picture',
+    );
+    unawaited(_pickSource(target));
+  }
+
+  /// Restores the stream PiP started on, after the window closes
+  /// (+31). No-op when no PiP drop is in effect, or when the viewer
+  /// already picked the original stream back by hand while PiP was up
+  /// (then `_pickSource` is a no-op and the drop is simply cleared).
+  void _restoreQualityAfterPip() {
+    final from = _pipDroppedFrom;
+    _pipDroppedFrom = null;
+    if (from == null || _disposed || from == _streamIndex) return;
+    ref.read(notificationServiceProvider).showInfo(
+      'Back to ${_thermalTargetLabel(from)}',
+      title: 'Picture-in-picture',
+    );
+    unawaited(_pickSource(from));
+  }
+
+  /// Starts the iOS mpv PiP diag log (+31): a tick every 5 s while the
+  /// window is up, logging the native diag string (gate + throughput).
+  /// debugPrint only. Cancelled on PiP stop (see the onPipStopped
+  /// handler) and in dispose.
+  void _startPipDiagLog() {
+    _pipDiagTimer?.cancel();
+    _pipDiagTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      if (_disposed) return;
+      final diag = await _iosPip?.diag;
+      if (diag == null || diag.isEmpty) return;
+      if (kDebugMode) debugPrint('[pip] diag: $diag');
+    });
   }
 
   /// Arms the PiP watchdog for the attempt that just went out.
@@ -1620,6 +1715,13 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// earns a fresh stall budget (see [_openStream]).
   Future<void> _onThermalTick() async {
     if (_disposed || !_startedPlaying || !_playing) return;
+    // +31: PiP owns quality while the window is up — the PiP drop
+    // (see `_dropQualityForPip`) already runs the lightest stream,
+    // and a thermal decision now would see the PiP target as a third
+    // source and cancel the governor's own drop episode. The
+    // governor's state is untouched, so its episode survives PiP and
+    // resumes when the window closes.
+    if (_inPip) return;
     final decision = _thermalGovernor.evaluate(
       thermal: await readThermalState(),
       qualities: _streams.map((stream) => stream.quality).toList(),
