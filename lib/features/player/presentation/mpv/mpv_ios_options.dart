@@ -74,6 +74,26 @@ const Map<String, String> kMpvIosOptions = <String, String>{
 String mpvIosHwdec({required bool pipEnabled}) =>
     pipEnabled ? 'videotoolbox-copy' : 'videotoolbox';
 
+/// Whether the VideoToolbox session is lost, from the live
+/// `hwdec-current` read-back (+40 P4).
+///
+/// `hwdec-current` is the decoder actually in use: `'videotoolbox'`
+/// (or `'videotoolbox-copy'` in PiP mode) while the session is alive,
+/// empty (or `'no'`) once iOS has invalidated it while the app was
+/// backgrounded — the overlay then reads `hwdec:` with nothing after
+/// it, and 4K falls back to software decode for the rest of the file
+/// (user proof 2026-11-15: Home → return, `vo-drop: 18 (+18)`,
+/// `vf-fps: 12`). Either VideoToolbox flavour counts as alive: a
+/// `'videotoolbox'` session under a PiP-mode expectation is hardware
+/// decode, just without the copy the SW renderer wants, and a
+/// `'videotoolbox-copy'` session under a normal expectation is the same
+/// hardware decoder. Pure, so it is unit-tested (see
+/// `mpv_hwdec_resume_test.dart`).
+bool hwdecSessionLost({required String current}) {
+  const alive = <String>{'videotoolbox', 'videotoolbox-copy'};
+  return !alive.contains(current.trim());
+}
+
 /// Applies [kMpvIosOptions] to a player's mpv instance, then reads the
 /// fallback back so the log shows what was set. Same best-effort shape
 /// as [applyMpvAndroidOptions] in `mpv_android_options.dart`: a single

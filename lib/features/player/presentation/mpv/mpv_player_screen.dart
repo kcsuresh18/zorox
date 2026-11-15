@@ -400,6 +400,11 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// at or below 1080p (nothing to cap).
   bool _pipRenderCapped = false;
 
+  /// Whether a VideoToolbox restore (+40 P4) is already running: the
+  /// resume hook and the PiP-stop hook can both fire for one return,
+  /// and two overlapping restores could re-open the stream twice.
+  bool _hwdecRestoreRunning = false;
+
   /// Where the open source started (its resume point, else zero): the
   /// pre-buffer cushion is measured from here, not from the stream start.
   Duration _openStart = Duration.zero;
@@ -705,6 +710,13 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
         _pipWatchdog = null;
         setState(() => _inPip = false);
       }
+      // +40 P4: iOS can invalidate the VideoToolbox session while the
+      // app is backgrounded, and the file then decodes in software for
+      // the rest of its run — 4K lags after every Home → return even
+      // though PiP was never used (user proof 2026-11-15). Check the
+      // live decoder and restore it when it is actually lost (see
+      // [_restoreHwdecOnResume]) — never when it is healthy.
+      unawaited(_restoreHwdecOnResume());
     }
     // A backstop behind the pause flush: the position at the moment the
     // app goes away is the one Continue Watching must have.
@@ -951,6 +963,11 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       _pipWatchdog?.cancel();
       _pipWatchdog = null;
       if (_inPip) setState(() => _inPip = false);
+      // +40 P4: same decoder check on the PiP → player return — the
+      // session can be lost under the window too, and this is where
+      // the re-open rung may run (the resumed hook above defers it
+      // while the window is up). See [_restoreHwdecOnResume].
+      unawaited(_restoreHwdecOnResume());
     };
     pip.onPipFailed = (reason) {
       if (kDebugMode) {
@@ -1922,6 +1939,83 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       sourceHeight: _currentStreamHeight ?? 0,
     );
     await _setIosRenderCap(target == PipRenderCap.capped1080p);
+  }
+
+  /// Restores the VideoToolbox decoder after the app comes back to the
+  /// foreground (+40 P4).
+  ///
+  /// iOS can invalidate the VideoToolbox session while the app is
+  /// backgrounded (Home, the app switcher — the `mpv_ios_options.dart`
+  /// header documents it), and the file then decodes in software for
+  /// the rest of its run: the user proved it on 2026-11-15, PiP NOT
+  /// used — normal play smooth, Home → return laggy, overlay `hwdec:`
+  /// empty, `vo-drop: 18 (+18)`, `vf-fps: 12`. The
+  /// `hwdec-software-fallback: 300` option did not save it. So the live
+  /// decoder is checked on every foreground resume, and restored only
+  /// when it is actually lost — a healthy session is never touched,
+  /// so an ordinary resume costs one property read.
+  ///
+  /// Two rungs, cheapest first: (1) re-apply the `hwdec` option to the
+  /// live player — mpv re-initialises the decoder when it changes —
+  /// then re-read after a second; a same-value set may be a no-op in
+  /// mpv, which is why the re-read decides, not the set. (2) If the
+  /// session is still lost, re-open the same stream at the playhead
+  /// ([_openStream] with the current index — the stall-recovery shape,
+  /// which keeps the subtitle anchor and re-applies the remembered
+  /// tracks); a fresh open always creates a fresh decoder with the
+  /// configured `hwdec`. The re-open never runs while the PiP window
+  /// is up (it would tear the feed down) or while an open is already
+  /// landing ([_awaitingPrebuffer]). No toast — the viewer only sees a
+  /// brief spinner on the re-open rung, and only when the decoder was
+  /// actually lost.
+  Future<void> _restoreHwdecOnResume() async {
+    if (_hwdecRestoreRunning) return;
+    if (defaultTargetPlatform != TargetPlatform.iOS) return;
+    if (_disposed || !mounted || !_playing) return;
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return;
+    _hwdecRestoreRunning = true;
+    try {
+      final expected = mpvIosHwdec(pipEnabled: _iosMpvPipEnabled);
+      final stats = await _readMpvStats();
+      if (_disposed || !mounted || !_playing) return;
+      // Unreadable is not evidence of loss: the property read itself
+      // failed, so do nothing rather than re-open a healthy player.
+      final current = stats['hwdec-current'];
+      if (current == null) return;
+      if (!hwdecSessionLost(current: current)) return;
+      debugPrint('[mpv] hwdec restore: session lost on resume '
+          '(hwdec-current="$current", expected "$expected")');
+      // Rung 1: re-apply hwdec to the live player.
+      try {
+        await platform.setProperty('hwdec', expected);
+      } catch (e) {
+        debugPrint('[mpv] hwdec restore: setProperty failed: $e');
+      }
+      await Future.delayed(const Duration(seconds: 1));
+      if (_disposed || !mounted || !_playing) return;
+      final after = await _readMpvStats();
+      if (_disposed || !mounted || !_playing) return;
+      final recovered = after['hwdec-current'];
+      if (recovered != null && !hwdecSessionLost(current: recovered)) {
+        debugPrint('[mpv] hwdec restore: session back '
+            '(hwdec-current="$recovered")');
+        return;
+      }
+      // Rung 2: re-open the same stream at the playhead. Never while
+      // the PiP window is up or an open is already landing.
+      if (_inPip || _awaitingPrebuffer) {
+        debugPrint('[mpv] hwdec restore: still lost, re-open deferred '
+            '(_inPip=$_inPip, _awaitingPrebuffer=$_awaitingPrebuffer)');
+        return;
+      }
+      if (_streamIndex < 0 || _streamIndex >= _streams.length) return;
+      debugPrint('[mpv] hwdec restore: still lost after setProperty, '
+          're-opening stream $_streamIndex at $_position');
+      unawaited(_openStream(_streamIndex, start: _position));
+    } finally {
+      _hwdecRestoreRunning = false;
+    }
   }
 
   /// The iOS render cap (+34): caps the native render target at
