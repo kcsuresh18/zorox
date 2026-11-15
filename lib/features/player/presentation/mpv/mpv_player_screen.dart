@@ -322,6 +322,14 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   Timer? _prebufferTimer;
   int _prebufferToken = 0;
 
+  /// +49: when true, [_startAfterPrebuffer] clears the wait without
+  /// playing — the resume re-open ([_openStream] with `autoPlay: false`)
+  /// refills the cache while the film stays paused, so the viewer taps
+  /// play into a full cushion instead of into a stall. Consumed on the
+  /// first [_startAfterPrebuffer] call; a later open resets it through
+  /// [_waitForPrebuffer], so a normal open always plays.
+  bool _prebufferHoldPlay = false;
+
   /// The pre-buffer target and hold cap for the open source, set in
   /// [_openStream]: the ordinary [_kPrebufferTarget]/[_kPrebufferMaxWait],
   /// or the high-bitrate pair for a 4K open (see
@@ -737,18 +745,21 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       // live decoder and restore it when it is actually lost (see
       // [_restoreHwdecOnResume]) — never when it is healthy.
       unawaited(_restoreHwdecOnResume());
-      // +48: re-sync the decoder on return from Home (PiP OFF). iOS
-      // suspends VideoToolbox while backgrounded and its reference
-      // frames go stale, so the player restarts mid-GOP — macroblocked
-      // for a few seconds, sometimes frozen — until the next keyframe
-      // (user proof 2026-11-16, Other Mommy 1080p). P4 cannot see it
-      // (it stands down while paused and while the session is alive).
-      // A seek to the playhead forces mpv to flush the decoder and
-      // restart from the nearest keyframe (the stall watchdog's nudge,
-      // same move). iOS only, PiP OFF only: PiP keeps decoding, so
-      // there is nothing stale to re-sync. The seek does not change the
-      // pause state — a film paused before Home stays paused, and its
-      // first frame after play is clean.
+      // +49: re-open the stream on return from Home (PiP OFF). +48's
+      // seek fixed the macroblocking (the decoder re-syncs from the
+      // nearest keyframe, and the picture came back clean) but the
+      // video stayed laggy and choppy: iOS also kills the HTTP socket
+      // while suspended, so mpv sits in a read timeout before it can
+      // serve data again, and the seek itself throws away the buffered
+      // cushion (user proof 2026-11-16, +48 installed: timestamp
+      // frozen at 07:13 for ~5 s, then a ~10 s jump). A re-open at the
+      // playhead is the superset fix — a fresh connection, a fresh
+      // decoder, and the pre-buffer refilled while still paused
+      // (`autoPlay: false` holds the play, see [_prebufferHoldPlay]),
+      // so the first frame after play is clean and the cache is full.
+      // iOS only, PiP OFF only: PiP keeps decoding, so there is
+      // nothing stale to re-open. P4 stands down while paused, so it
+      // cannot double-fire a re-open here.
       if (defaultTargetPlatform == TargetPlatform.iOS &&
           shouldResyncDecoderOnResume(
             pipEnabled: _iosMpvPipEnabled,
@@ -758,8 +769,13 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
             hasStream:
                 _streamIndex >= 0 && _streamIndex < _streams.length,
           )) {
-        debugPrint('[mpv] resume re-sync: seeking to $_position');
-        unawaited(_player.seek(_position));
+        debugPrint('[mpv] resume re-open: reopening stream '
+            '$_streamIndex at $_position');
+        unawaited(_openStream(
+          _streamIndex,
+          start: _position,
+          autoPlay: false,
+        ));
       }
     }
     // A backstop behind the pause flush: the position at the moment the
@@ -1661,7 +1677,11 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     }
   }
 
-  Future<void> _openStream(int index, {Duration? start}) async {
+  Future<void> _openStream(
+    int index, {
+    Duration? start,
+    bool autoPlay = true,
+  }) async {
     if (_disposed || _streams.isEmpty) return;
     // A genuinely different source (failover / source pick) ends the old
     // subtitle pick: the adapter's anchor belongs to the old media. A
@@ -1752,7 +1772,7 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       return;
     }
     _armWatchdog();
-    _waitForPrebuffer();
+    _waitForPrebuffer(autoPlay: autoPlay);
     if (mounted) setState(() {});
   }
 
@@ -1761,9 +1781,14 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// a slow one waits at most _kPrebufferMaxWait and then plays anyway (the
   /// cache-pause will stall it if the server cannot keep up — same as
   /// before, but now from a cushion rather than from the first frame).
-  void _waitForPrebuffer() {
+  ///
+  /// +49: `autoPlay: false` (the resume re-open) holds the play — the
+  /// pre-buffer still fills, but [_startAfterPrebuffer] leaves the film
+  /// paused (see [_prebufferHoldPlay]).
+  void _waitForPrebuffer({bool autoPlay = true}) {
     final token = ++_prebufferToken;
     _awaitingPrebuffer = true;
+    _prebufferHoldPlay = !autoPlay;
     if (_prebufferReady) {
       _startAfterPrebuffer(token);
       return;
@@ -1786,6 +1811,11 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     _prebufferTimer?.cancel();
     _prebufferTimer = null;
     if (_disposed) return;
+    if (_prebufferHoldPlay) {
+      // +49 resume re-open: stay paused (see [_prebufferHoldPlay]).
+      _prebufferHoldPlay = false;
+      return;
+    }
     unawaited(_player.play());
   }
 
@@ -2006,7 +2036,10 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// the rest of its run: the user proved it on 2026-11-15, PiP NOT
   /// used — normal play smooth, Home → return laggy, overlay `hwdec:`
   /// empty, `vo-drop: 18 (+18)`, `vf-fps: 12`. The
-  /// `hwdec-software-fallback: 300` option did not save it. So the live
+  /// `hwdec-software-fallback: 300` option did not save it (+49: the
+  /// 300 was part of the problem — it tolerates ~12 s of failed
+  /// decoding before falling back, and skips the failed packets; the
+  /// mpv default is 3). So the live
   /// decoder is checked on every foreground resume, and restored only
   /// when it is actually lost — a healthy session is never touched,
   /// so an ordinary resume costs one property read.

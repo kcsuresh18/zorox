@@ -5,12 +5,19 @@
 /// `hwdec-software-fallback: 300` on iOS, with the comment that iOS can
 /// invalidate the VideoToolbox session — e.g. Notification Center during
 /// PiP — and FFmpeg recreates it at the next frames; keep hardware
-/// decoding meanwhile. ZoroX set the fallback on Android only, so on iOS
-/// a lost VideoToolbox session dropped to software decode for the rest
-/// of the file: the CPU burned, the phone got hotter, and 4K stayed
-/// laggy once hot (user report 2026-11-15). The fallback is the fix for
-/// that spiral: a lost session is recreated and hardware decode resumes,
-/// instead of the file playing in software until it ends.
+/// decoding meanwhile. ZoroX copied the 300 (+40), but mpv's manual
+/// says the default is 3 and a higher number is harmful: the fallback
+/// only triggers after N consecutive failed frames, so 300 tolerates
+/// ~12 s of failed decoding before falling back to software — and when
+/// it finally falls back, the failed packets are SKIPPED ("parts of the
+/// file will be skipped, approximately by to the number of packets that
+/// could not be decoded"). That matches the user's +48 symptom exactly
+/// (timestamp frozen ~5 s, then a ~10 s jump). +49 returns to mpv's
+/// default of 3: a dead session falls back to software after 3 failed
+/// frames (~125 ms), and mpv retains the packets, so there is no skip.
+/// The resume re-open (see [shouldResyncDecoderOnResume]) recreates
+/// the hardware decoder anyway, so a software fallback is only ever a
+/// brief bridge, never the rest of the file.
 ///
 /// `framedrop: vo` is mpv's recommended mode (+34, was `decoder+vo`):
 /// when a frame cannot be presented in time it is dropped instead of
@@ -51,8 +58,22 @@ import 'package:flutter/foundation.dart';
 import 'package:media_kit/media_kit.dart';
 
 /// The iOS-only mpv options, as `option → value`.
+/// The reconnect options (+49): iOS kills the HTTP socket while the app
+/// is suspended, so on return mpv sits in a read timeout before it can
+/// serve data again — the 5 s freeze + ~10 s catch-up jump the user
+/// reported on +48 (Other Mommy 1080p, PiP OFF, Home → return, timestamp
+/// frozen at 07:13 then jumping to 07:23). The source is a direct HTTP
+/// file link, not HLS, and these are FFmpeg http-protocol options, so
+/// they apply to it: `reconnect=1` re-establishes a dead socket
+/// automatically, `reconnect_streamed=1` covers streamed variants, and
+/// `reconnect_delay_max=2` caps the retry delay at 2 s. `network-timeout:
+/// 5` caps a single read at 5 s so a dead socket fails fast instead of
+/// hanging on the OS TCP timeout. They ride along with the resume
+/// re-open (see [shouldResyncDecoderOnResume]): the re-open is the
+/// fresh connection, these are the safety net if a socket dies
+/// mid-stream.
 const Map<String, String> kMpvIosOptions = <String, String>{
-  'hwdec-software-fallback': '300',
+  'hwdec-software-fallback': '3',
   'framedrop': 'vo',
   'demuxer-max-bytes': '256MiB',
   'scale': 'bilinear',
@@ -62,6 +83,8 @@ const Map<String, String> kMpvIosOptions = <String, String>{
   'dither-depth': 'no',
   'correct-downscaling': 'no',
   'tone-mapping': 'clip',
+  'stream-lavf-o': 'reconnect=1,reconnect_streamed=1,reconnect_delay_max=2',
+  'network-timeout': '5',
 };
 
 /// The `hwdec` value for the iOS VideoController.
@@ -94,7 +117,7 @@ bool hwdecSessionLost({required String current}) {
   return !alive.contains(current.trim());
 }
 
-/// Whether the decoder needs a re-sync seek on app resume (+48).
+/// Whether the stream needs a re-open on app resume (+48, +49).
 ///
 /// iOS suspends the VideoToolbox decoder while the app is backgrounded,
 /// and its reference frames go stale — on resume the player restarts
@@ -107,13 +130,21 @@ bool hwdecSessionLost({required String current}) {
 /// `resumeUponEnteringForegroundMode` defaults to false), and even when
 /// it runs it stands down while the session is alive
 /// (`hwdec-current == videotoolbox`) — alive is not the same as
-/// in-sync. A seek to the current position forces mpv to flush the
-/// decoder and restart from the nearest keyframe (the stall watchdog's
-/// nudge, same move), so the first frame after play is clean.
+/// in-sync. +48 fixed the macroblocking with a seek to the playhead
+/// (flush the decoder, restart from the nearest keyframe), and the
+/// picture came back clean — but the video stayed laggy and choppy
+/// (user proof 2026-11-16, +48 installed: timestamp frozen at 07:13
+/// for ~5 s, then a ~10 s jump). The seek fixes the decoder but not
+/// the second problem: iOS also kills the HTTP socket while suspended,
+/// so mpv sits in a read timeout before it can serve data again, and
+/// the seek itself throws away the buffered cushion. +49 re-opens the
+/// stream at the playhead instead (same gates): a fresh connection, a
+/// fresh decoder, and the pre-buffer refilled while still paused, so
+/// the first frame after play is clean and the cache is full.
 ///
 /// Only when the player was actually background-paused: PiP keeps
 /// decoding (no pause, nothing stale), an open landing re-syncs on its
-/// own, and a film that never started has no position to seek to.
+/// own, and a film that never started has no position to re-open at.
 /// Pure, so it is unit-tested (see `mpv_resume_resync_test.dart`).
 bool shouldResyncDecoderOnResume({
   required bool pipEnabled,

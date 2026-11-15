@@ -74,10 +74,12 @@ void main() {
   });
 
   group('kMpvIosOptions', () {
-    test('keeps the VideoToolbox session alive under heat', () {
-      // Nuvio's value: 300 frames of hardware decode while FFmpeg
-      // recreates an invalidated session.
-      expect(kMpvIosOptions['hwdec-software-fallback'], '300');
+    test('falls back to software quickly if the session dies (+49)', () {
+      // mpv's default is 3: fallback after 3 consecutive failed
+      // frames (~125 ms). Nuvio's 300 tolerated ~12 s of failed
+      // decoding and skipped the failed packets on fallback (the
+      // user's +48 freeze + jump) — so +49 returns to the default.
+      expect(kMpvIosOptions['hwdec-software-fallback'], '3');
     });
 
     test('drops frames instead of falling behind, like Android', () {
@@ -98,6 +100,19 @@ void main() {
       // NOT peak compute: `hdr-compute-peak` (the v20+1 black-screen
       // value) stays out, and media_kit forces it off.
       expect(kMpvIosOptions['tone-mapping'], 'clip');
+    });
+
+    test('reconnects a socket iOS killed while suspended (+49)', () {
+      // The 5 s freeze + ~10 s catch-up jump on +48 (Home → return):
+      // FFmpeg http-protocol options, so they apply to a direct HTTP
+      // file link as well as HLS. A dead socket reconnects within the
+      // 2 s cap instead of hanging on the OS TCP timeout, and a single
+      // read fails fast at 5 s.
+      expect(
+        kMpvIosOptions['stream-lavf-o'],
+        'reconnect=1,reconnect_streamed=1,reconnect_delay_max=2',
+      );
+      expect(kMpvIosOptions['network-timeout'], '5');
     });
 
     test('never carries the options that blank the video', () {

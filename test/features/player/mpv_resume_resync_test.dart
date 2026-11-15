@@ -1,10 +1,15 @@
-/// Resume decoder re-sync decision (+48): on return from Home (PiP OFF)
+/// Resume re-open decision (+48, +49): on return from Home (PiP OFF)
 /// the VideoToolbox decoder's reference frames are stale from the
 /// background suspension, so the player restarts mid-GOP — macroblocked
-/// for a few seconds, sometimes frozen — until the next keyframe. The
-/// seek to the playhead is only wanted when the player was actually
-/// background-paused: PiP keeps decoding, an open landing re-syncs on
-/// its own, and a film that never started has no position to seek to.
+/// for a few seconds, sometimes frozen — until the next keyframe. +48
+/// fixed that with a seek to the playhead, but the video stayed laggy
+/// and choppy (the HTTP socket is killed too, and the seek throws away
+/// the buffered cushion), so +49 re-opens the stream at the playhead
+/// instead — same gates, fresh connection + fresh decoder + pre-buffer
+/// while still paused. The re-open is only wanted when the player was
+/// actually background-paused: PiP keeps decoding, an open landing
+/// re-syncs on its own, and a film that never started has no position
+/// to re-open at.
 library;
 
 import 'package:flutter_test/flutter_test.dart';
