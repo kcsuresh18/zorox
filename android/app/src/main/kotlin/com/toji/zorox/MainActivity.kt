@@ -16,6 +16,7 @@ import io.flutter.plugin.common.MethodChannel
 import android.app.ActivityManager
 import android.app.PictureInPictureParams
 import android.os.Build
+import android.os.PowerManager
 import android.util.Rational
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -70,22 +71,47 @@ class MainActivity : com.lagradost.cloudstream3.MainActivity(), FlutterEngineCon
 
         // What the player sizes its read-ahead from (lib/core/providers/device_memory.dart).
         // lowRam is the OEM's verdict, isLowRamDevice(); MemoryInfo.lowMemory only says
-        // memory is short at this moment.
+        // memory is short at this moment. `thermalState` (+33) is the Android half of the
+        // thermal watch (see lib/core/providers/thermal_state.dart): the PowerManager thermal
+        // status, mapped to the iOS 0–3 shape the Dart side reads — NONE cool, LIGHT warm,
+        // MODERATE/SEVERE throttling, CRITICAL/EMERGENCY/SHUTDOWN throttling hard. API 29+;
+        // older devices have no such reading and answer notImplemented, which Dart reads as
+        // unknown.
         MethodChannel(messenger, MEMORY_CHANNEL).setMethodCallHandler { call, result ->
-            if (call.method != "read") {
-                result.notImplemented()
-                return@setMethodCallHandler
+            when (call.method) {
+                "read" -> {
+                    val manager = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+                    val info = ActivityManager.MemoryInfo()
+                    manager.getMemoryInfo(info)
+                    result.success(
+                        mapOf(
+                            "totalMb" to info.totalMem / 1_048_576L,
+                            "freeMb" to info.availMem / 1_048_576L,
+                            "lowRam" to manager.isLowRamDevice,
+                        ),
+                    )
+                }
+                "thermalState" -> {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                        result.notImplemented()
+                        return@setMethodCallHandler
+                    }
+                    val power = getSystemService(POWER_SERVICE) as PowerManager
+                    result.success(
+                        when (power.currentThermalStatus) {
+                            PowerManager.THERMAL_STATUS_NONE -> 0
+                            PowerManager.THERMAL_STATUS_LIGHT -> 1
+                            PowerManager.THERMAL_STATUS_MODERATE,
+                            PowerManager.THERMAL_STATUS_SEVERE -> 2
+                            PowerManager.THERMAL_STATUS_CRITICAL,
+                            PowerManager.THERMAL_STATUS_EMERGENCY,
+                            PowerManager.THERMAL_STATUS_SHUTDOWN -> 3
+                            else -> 0
+                        },
+                    )
+                }
+                else -> result.notImplemented()
             }
-            val manager = getSystemService(ACTIVITY_SERVICE) as ActivityManager
-            val info = ActivityManager.MemoryInfo()
-            manager.getMemoryInfo(info)
-            result.success(
-                mapOf(
-                    "totalMb" to info.totalMem / 1_048_576L,
-                    "freeMb" to info.availMem / 1_048_576L,
-                    "lowRam" to manager.isLowRamDevice,
-                )
-            )
         }
 
         // PiP Channel

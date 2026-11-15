@@ -95,6 +95,28 @@ double subtitleRaiseAfterHorizontalSwipe(
   return subtitleRaiseAfterSlide(startRaise, dxShare);
 }
 
+/// The pinch zoom's range (v18): the picture never shrinks below half
+/// size or grows past 3x. The screen's Transform clamps to the same
+/// range (see `_kMinZoom` / `_kMaxZoom` in `mpv_player_screen.dart`), so
+/// the notifier and the render can never disagree.
+const double kVideoScaleMin = 0.5;
+
+/// The pinch zoom's range (v18): see [kVideoScaleMin].
+const double kVideoScaleMax = 3.0;
+
+/// A zoom inside the pinch range: held there, so a wild gesture lands on
+/// an end rather than outside it. Pure, so it is unit-tested.
+double clampVideoScale(double scale) =>
+    scale.clamp(kVideoScaleMin, kVideoScaleMax).toDouble();
+
+/// The zoom a pinch lands on: [startScale] is the zoom when the pinch
+/// started and [gestureScale] is the fingers' distance relative to the
+/// gesture's start — over 1.0 while spreading apart (zoom in), under 1.0
+/// while pinching in (zoom out). Held to the pinch range. Pure, so it is
+/// unit-tested.
+double videoScaleAfterPinch(double startScale, double gestureScale) =>
+    clampVideoScale(startScale * gestureScale);
+
 class GoldenPlayerControls extends ConsumerStatefulWidget {
   const GoldenPlayerControls({
     required this.controller,
@@ -450,9 +472,8 @@ class _GoldenPlayerControlsState
       if (notifier == null) return;
       // details.scale is the fingers' distance relative to the gesture's
       // start — under 1.0 while pinching in — so this falls as well as
-      // rises. clamp() returns num; toDouble() keeps the value a double.
-      final double scale =
-          (_pinchStartScale * d.scale).clamp(0.5, 3.0).toDouble();
+      // rises.
+      final double scale = videoScaleAfterPinch(_pinchStartScale, d.scale);
       if (scale != notifier.value) notifier.value = scale;
       return;
     }
@@ -512,7 +533,7 @@ class _GoldenPlayerControlsState
       _pinching = false;
       final notifier = widget.videoScale;
       if (notifier != null) {
-        final double settled = notifier.value.clamp(0.5, 3.0).toDouble();
+        final double settled = clampVideoScale(notifier.value);
         if (settled != notifier.value) notifier.value = settled;
       }
       _panAxis = _GoldenPanAxis.none;

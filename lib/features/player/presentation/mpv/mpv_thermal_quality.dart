@@ -11,7 +11,10 @@
 /// second half: when the OS itself says the phone is serious or critical,
 /// drop the 4K stream for the best lighter one, so the decoder has less
 /// work and the phone can cool; restore the original when it stays
-/// nominal for a minute.
+/// nominal for a minute. A single-file source has no lighter stream to
+/// drop to (+33: the 20.96 GB 4K file), so there the governor lightens
+/// the render instead — `vf` scale to 1080p plus the fast-decode
+/// options — and takes it off on the same 2-nominal-polls rule.
 ///
 /// The governor is pure: it decides, the player screen acts. It keeps
 /// the drop episode's state — what it dropped from and to, the nominal
@@ -40,7 +43,48 @@ enum ThermalQualityKind {
   /// lighter streams. Only for an adaptive (HLS) master, which has no
   /// ladder to switch down — mpv's ABR picks the rendition.
   hint,
+
+  /// No stream switch: lighten the render of the stream now playing
+  /// (see [kThermalLightenVf] / [kThermalLightenProperties]) — the
+  /// single-file answer. A single-file direct link has no ladder, so
+  /// [drop] is impossible there; the render is lightened instead, and
+  /// [unlighten] takes it off when the phone cools.
+  lighten,
+
+  /// Remove the render lightening [lighten] put on.
+  unlighten,
 }
+
+/// The render lightening the governor asks for on a single-file source
+/// (see [ThermalQualityKind.lighten]): downscale the video filter chain
+/// to 1080p, so the render — software in PiP, tone-mapping on the GPU
+/// in normal playback — has a quarter of the pixels to chew. Only for a
+/// stream taller than [ThermalQualityGovernor.dropAboveHeight]; a light
+/// stream needs no lightening.
+const String kThermalLightenVf = 'scale=-2:1080';
+
+/// The mpv properties the lighten response sets, as `option → value`,
+/// and the values that clear them again. `vd-lavc-skiploopfilter` and
+/// `vd-lavc-fast` are a hedge for the case the VideoToolbox session is
+/// lost and decode is software (the +27 root cause): harmless while
+/// hardware decode is alive, a big saving while it is not. `vf` is the
+/// part that always helps — it re-inits the filter chain at once, no
+/// re-open needed. Verified against mpv's option list: `vf` is a
+/// runtime property, `vd-lavc-skiploopfilter` takes
+/// none/default/nonref/bidir/nonkey/all, `vd-lavc-fast` is a flag.
+const Map<String, String> kThermalLightenProperties = <String, String>{
+  'vf': kThermalLightenVf,
+  'vd-lavc-skiploopfilter': 'all',
+  'vd-lavc-fast': 'yes',
+};
+
+/// The values that undo [kThermalLightenProperties]: an empty filter
+/// chain, and the lavc defaults.
+const Map<String, String> kThermalUnlightenProperties = <String, String>{
+  'vf': '',
+  'vd-lavc-skiploopfilter': 'default',
+  'vd-lavc-fast': 'no',
+};
 
 /// One tick's decision: [kind] + the stream index to switch to.
 /// [targetIndex] is -1 for [ThermalQualityKind.none] and
@@ -59,6 +103,16 @@ class ThermalQualityDecision {
 
   const ThermalQualityDecision.hint()
     : kind = ThermalQualityKind.hint,
+      targetIndex = -1;
+
+  /// Lighten the render of the stream now playing (single-file only).
+  const ThermalQualityDecision.lighten()
+    : kind = ThermalQualityKind.lighten,
+      targetIndex = -1;
+
+  /// Take the render lightening off again.
+  const ThermalQualityDecision.unlighten()
+    : kind = ThermalQualityKind.unlighten,
       targetIndex = -1;
 
   final ThermalQualityKind kind;
@@ -120,6 +174,15 @@ class ThermalQualityGovernor {
   int _nominalStreak = 0;
   bool _hintShown = false;
 
+  /// While the render lightening is on (single-file response).
+  bool _lightened = false;
+
+  /// Consecutive nominal ticks while lightened, before it comes off.
+  int _lightenNominalStreak = 0;
+
+  /// True while the render lightening is on (single-file response).
+  bool get isLightened => _lightened;
+
   /// True while a governor drop is in effect.
   bool get isDropped => _droppedFrom != null;
 
@@ -134,15 +197,40 @@ class ThermalQualityGovernor {
 
   /// One tick's decision. Never throws: a bad index or an empty list is
   /// no change.
+  ///
+  /// [inPip] is true while the PiP window is up (+31): the PiP drop owns
+  /// quality then, so the ladder logic is skipped entirely — a ladder
+  /// decision would see the PiP target as a third source and cancel the
+  /// governor's own drop episode — and only the render lightening is
+  /// evaluated. Lightening changes no stream, so it cannot fight the
+  /// PiP drop, and for a single-file source it is the only thermal
+  /// relief there is.
   ThermalQualityDecision evaluate({
     required ThermalState thermal,
     required List<int?> qualities,
     required int currentIndex,
+    bool inPip = false,
   }) {
     if (currentIndex < 0 || currentIndex >= qualities.length) {
       return const ThermalQualityDecision.none();
     }
     final height = qualities[currentIndex];
+
+    if (inPip) {
+      return _evaluateLighten(
+        thermal: thermal,
+        height: height,
+        currentIndex: currentIndex,
+      );
+    }
+
+    if (_lightened) {
+      return _evaluateLightened(
+        thermal: thermal,
+        height: height,
+        currentIndex: currentIndex,
+      );
+    }
 
     if (_droppedFrom != null) {
       if (currentIndex == _droppedFrom) {
@@ -206,11 +294,86 @@ class ThermalQualityGovernor {
     }
     if (height <= dropAboveHeight) return const ThermalQualityDecision.none();
     final target = _bestLighterIndex(qualities, height);
-    if (target == null) return const ThermalQualityDecision.none();
-    _droppedFrom = currentIndex;
-    _droppedTo = target;
-    _nominalStreak = 0;
-    return ThermalQualityDecision.drop(target);
+    if (target != null) {
+      _droppedFrom = currentIndex;
+      _droppedTo = target;
+      _nominalStreak = 0;
+      return ThermalQualityDecision.drop(target);
+    }
+    // No lighter stream: a single-file source (the 20.96 GB 4K file the
+    // user reported, 2026-11-15) — the ladder drop is a no-op there, so
+    // lighten the render instead. The stream never changes, so a hand
+    // pick cannot be overridden by this; the manual-pick latch above
+    // already returned for a picked stream.
+    _lightened = true;
+    _lightenNominalStreak = 0;
+    return const ThermalQualityDecision.lighten();
+  }
+
+  /// The render lightening, evaluated while the PiP window is up (see
+  /// [evaluate]): the only thermal response that cannot fight the PiP
+  /// drop, because it changes no stream.
+  ThermalQualityDecision _evaluateLighten({
+    required ThermalState thermal,
+    required int? height,
+    required int currentIndex,
+  }) {
+    // A hand pick stands, in PiP as out of it; a pick that is no longer
+    // current is forgotten.
+    if (_manualPickIndex != null) {
+      if (currentIndex == _manualPickIndex) {
+        if (thermal == ThermalState.nominal) _manualPickIndex = null;
+        return const ThermalQualityDecision.none();
+      }
+      _manualPickIndex = null;
+    }
+    if (_lightened) {
+      return _evaluateLightened(
+        thermal: thermal,
+        height: height,
+        currentIndex: currentIndex,
+      );
+    }
+    if (thermal != ThermalState.serious &&
+        thermal != ThermalState.critical) {
+      return const ThermalQualityDecision.none();
+    }
+    if (height == null || height == 0 || height <= dropAboveHeight) {
+      return const ThermalQualityDecision.none();
+    }
+    _lightened = true;
+    _lightenNominalStreak = 0;
+    return const ThermalQualityDecision.lighten();
+  }
+
+  /// The lightened state: watch for cooling, or for the stream itself
+  /// becoming light (a switch to a lighter source makes the lightening
+  /// pointless). Anything but nominal resets the streak, so the
+  /// lightening only comes off on a phone that is really cool.
+  ThermalQualityDecision _evaluateLightened({
+    required ThermalState thermal,
+    required int? height,
+    required int currentIndex,
+  }) {
+    if (height != null && height > 0 && height <= dropAboveHeight) {
+      _clearLighten();
+      return const ThermalQualityDecision.unlighten();
+    }
+    if (thermal == ThermalState.nominal) {
+      _lightenNominalStreak++;
+      if (_lightenNominalStreak >= restoreNominalTicks) {
+        _clearLighten();
+        return const ThermalQualityDecision.unlighten();
+      }
+    } else {
+      _lightenNominalStreak = 0;
+    }
+    return const ThermalQualityDecision.none();
+  }
+
+  void _clearLighten() {
+    _lightened = false;
+    _lightenNominalStreak = 0;
   }
 
   /// The best lighter stream for the governor's ceiling.

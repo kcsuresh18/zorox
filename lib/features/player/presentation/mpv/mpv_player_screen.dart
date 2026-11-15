@@ -1222,11 +1222,13 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       const Duration(seconds: 2),
       (_) => _onStallTick(),
     );
-    // The thermal watch (iOS only): a tick every [_kThermalPoll] that
-    // reads the phone's heat and drops a 4K stream for 1080p when it is
-    // serious or critical, restoring it when the phone cools (see
-    // [_onThermalTick]).
-    if (defaultTargetPlatform == TargetPlatform.iOS) {
+    // The thermal watch (iOS + Android, +33): a tick every [_kThermalPoll]
+    // that reads the phone's heat and drops a 4K stream for 1080p when it
+    // is serious or critical, restoring it when the phone cools — or, for
+    // a single-file source with no ladder, lightens the render instead
+    // (see [_onThermalTick]).
+    if (defaultTargetPlatform == TargetPlatform.iOS ||
+        defaultTargetPlatform == TargetPlatform.android) {
       _thermalTimer = Timer.periodic(
         _kThermalPoll,
         (_) => unawaited(_onThermalTick()),
@@ -1714,27 +1716,31 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     }
   }
 
-  /// The thermal watch's tick (iOS only, every [_kThermalPoll] while the
-  /// screen lives): reads the phone's heat and asks the governor whether
-  /// it wants a quality change. Stands down unless a film is actually
+  /// The thermal watch's tick (iOS + Android, +33; every [_kThermalPoll]
+  /// while the screen lives): reads the phone's heat and asks the governor
+  /// whether it wants a quality change. Stands down unless a film is
   /// playing — a paused film needs no drop, and the governor's restore
   /// streak only counts while playing. A switch is the same
   /// [_pickSource] a tap on a source row makes, so it re-opens at the
   /// playhead, re-applies the remembered audio/subtitle tracks, and
   /// earns a fresh stall budget (see [_openStream]).
+  ///
+  /// +33: the tick runs during PiP too, but only the render lightening
+  /// is decided there — the governor's ladder logic is skipped while
+  /// [_inPip], because the PiP drop (see `_dropQualityForPip`) owns
+  /// quality while the window is up, and a ladder decision would see
+  /// the PiP target as a third source and cancel the governor's own
+  /// drop episode. The lightening changes no stream, so it cannot
+  /// fight the PiP drop, and for a single-file source it is the only
+  /// thermal relief there is (user report 2026-11-15: the 20.96 GB 4K
+  /// file lags even without PiP).
   Future<void> _onThermalTick() async {
     if (_disposed || !_startedPlaying || !_playing) return;
-    // +31: PiP owns quality while the window is up — the PiP drop
-    // (see `_dropQualityForPip`) already runs the lightest stream,
-    // and a thermal decision now would see the PiP target as a third
-    // source and cancel the governor's own drop episode. The
-    // governor's state is untouched, so its episode survives PiP and
-    // resumes when the window closes.
-    if (_inPip) return;
     final decision = _thermalGovernor.evaluate(
       thermal: await readThermalState(),
       qualities: _streams.map((stream) => stream.quality).toList(),
       currentIndex: _streamIndex,
+      inPip: _inPip,
     );
     if (decision.isNone || _disposed) return;
     switch (decision.kind) {
@@ -1760,6 +1766,64 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
           'tab to stay smooth',
           title: 'Phone is hot',
         );
+      case ThermalQualityKind.lighten:
+        // A single-file source: no ladder to drop to, so lighten the
+        // render instead. The stream never changes, so playback
+        // carries on at the playhead.
+        unawaited(_applyThermalLighten());
+        ref.read(notificationServiceProvider).showInfo(
+          'Phone is heating up — playing at reduced detail to stay '
+          'smooth',
+          title: 'Phone is hot',
+        );
+      case ThermalQualityKind.unlighten:
+        unawaited(_clearThermalLighten());
+        ref.read(notificationServiceProvider).showInfo(
+          'Phone cooled down — back to full detail',
+          title: 'Phone cooled down',
+        );
+    }
+  }
+
+  /// The +33 single-file thermal response: lighten the render of the
+  /// stream now playing (see [kThermalLightenProperties]) — a `vf`
+  /// scale to 1080p plus the fast-decode options. Applied at runtime
+  /// through the native player, so no re-open is needed; the same
+  /// `setProperty` path the screen already uses for `sub-visibility`
+  /// in PiP. Best effort: a property mpv refuses is ignored, and the
+  /// screen keeps playing.
+  Future<void> _applyThermalLighten() async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return;
+    for (final entry in kThermalLightenProperties.entries) {
+      try {
+        await platform.setProperty(entry.key, entry.value);
+      } catch (_) {
+        // Best-effort: one refused property must not stop the others.
+      }
+    }
+    if (kDebugMode) {
+      debugPrint(
+        'mpv thermal: lightening the render '
+        '($kThermalLightenVf) for a single-file 4K stream',
+      );
+    }
+  }
+
+  /// Take the +33 render lightening off again (the phone cooled, or
+  /// the stream itself is light now).
+  Future<void> _clearThermalLighten() async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return;
+    for (final entry in kThermalUnlightenProperties.entries) {
+      try {
+        await platform.setProperty(entry.key, entry.value);
+      } catch (_) {
+        // Best-effort: one refused property must not stop the others.
+      }
+    }
+    if (kDebugMode) {
+      debugPrint('mpv thermal: render lightening cleared');
     }
   }
 
