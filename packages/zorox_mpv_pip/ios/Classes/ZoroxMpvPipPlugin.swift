@@ -350,6 +350,7 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       // PipHostView (+29) so the layer tracks the window on rotation:
       // a plain sublayer keeps the frame it was created with.
       let host = PipHostView(frame: rootView.bounds)
+      host.isUserInteractionEnabled = false
       host.autoresizingMask = [.flexibleWidth, .flexibleHeight]
       host.isHidden = false
       displayLayer.frame = host.bounds
