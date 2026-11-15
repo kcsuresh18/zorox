@@ -145,6 +145,39 @@ class AppTheme {
     // Cards / list items in the design's surface colour.
     colorScheme = colorScheme.copyWith(surface: const Color(0xFF161618));
 
+    // White/Black accents (v20+37): ColorScheme.fromSeed builds a tonal
+    // palette from the seed and the seed itself never becomes `primary` —
+    // for achromatic seeds the palette is the same neutral ramp, so White
+    // and Black collapse to the identical light-grey primary and neither
+    // looks like the swatch that was tapped (the picker checkmark moves,
+    // the app does not recolor). Pin the primary family to the literal
+    // accent for the two monochrome presets; the other eight presets keep
+    // the tonal scheme untouched. onPrimary follows the same luminance
+    // guard the light theme already uses (dark text on White, white text
+    // on Black). Note Black on the dark theme is near-invisible by design
+    // — black on obsidian — it is meant for the light theme.
+    if (seedColor == const Color(0xFFFFFFFF) ||
+        seedColor == const Color(0xFF000000)) {
+      final isWhite = seedColor == const Color(0xFFFFFFFF);
+      final onAccent = isWhite
+          ? const Color(0xFF1A1A1A)
+          : Colors.white;
+      final container = isWhite
+          ? const Color(0xFF2E2E33)
+          : const Color(0xFF1C1C1F);
+      colorScheme = colorScheme.copyWith(
+        primary: seedColor,
+        onPrimary: onAccent,
+        primaryContainer: container,
+        onPrimaryContainer: Colors.white,
+        tertiary: seedColor,
+        onTertiary: onAccent,
+        tertiaryContainer: container,
+        onTertiaryContainer: Colors.white,
+        surfaceTint: seedColor,
+      );
+    }
+
     return ThemeData(
       useMaterial3: true,
       brightness: Brightness.dark,

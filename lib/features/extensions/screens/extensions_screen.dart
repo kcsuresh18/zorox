@@ -14,7 +14,6 @@ import 'plugin_settings_dialog.dart';
 import '../../../shared/widgets/cards_wrapper.dart';
 import '../../../shared/widgets/loading_indicator.dart';
 import '../../../shared/widgets/text_input_dialog.dart';
-import '../../../core/router/app_router.dart';
 import '../../../shared/focus/app_focus.dart';
 
 import 'package:skystream/l10n/generated/app_localizations.dart';
@@ -270,18 +269,11 @@ class _ExtensionsScreenState extends ConsumerState<ExtensionsScreen>
 
     return Scaffold(
       appBar: AppBar(
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back_rounded),
-          tooltip: MaterialLocalizations.of(context).backButtonTooltip,
-          onPressed: () {
-            if (Navigator.of(context).canPop()) {
-              Navigator.of(context).pop();
-            } else {
-              const SettingsRoute().go(context);
-            }
-          },
-        ),
-        title: const Text('SkyStream Providers'),
+        // No back button (v20+37): the bottom pill nav (Plugins tab) is
+        // the way back. automaticallyImplyLeading is off too, so a pushed
+        // route does not imply one either.
+        automaticallyImplyLeading: false,
+        title: const Text('Plugins'),
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(48),
           child: Center(

@@ -58,19 +58,10 @@ class SettingsScreen extends ConsumerWidget {
                 SettingsGroup(
                   title: l10n.extensions,
                   children: [
-                    SettingsTile(
-                      icon: Icons.extension_rounded,
-                      title: 'SkyStream Providers',
-                      subtitle: l10n.installRemoveProviders,
-                      onTap: () => const ExtensionsRoute().go(context),
-                    ),
-                    SettingsTile(
-                      icon: Icons.cloud_rounded,
-                      title: l10n.cloudStreamExtensions,
-                      isBeta: true,
-                      subtitle: l10n.cloudStreamExtensionsSubtitle,
-                      onTap: () => const CloudStreamRoute().go(context),
-                    ),
+                    // v20+37: the SkyStream Providers and CloudStream
+                    // Extensions rows are gone from Settings — the
+                    // Providers screen lives on the bottom-nav Plugins tab
+                    // only. Nuvio Plugins and Stremio Add-ons stay.
                     SettingsTile(
                       icon: Icons.hub_rounded,
                       title: 'Nuvio Plugins',
