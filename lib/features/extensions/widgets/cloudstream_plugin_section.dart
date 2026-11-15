@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../../core/cloudstream/cloudstream_engine.dart';
 import '../../../core/cloudstream/cloudstream_models.dart';
 import '../../../core/widgets/app_snack_bar.dart';
 import '../../../core/cloudstream/cloudstream_repository.dart';
@@ -10,6 +11,7 @@ import '../../../core/utils/layout_constants.dart';
 import '../../../l10n/generated/app_localizations.dart';
 import '../../../shared/widgets/loading_indicator.dart';
 import '../../../shared/widgets/text_input_dialog.dart';
+import '../../cloudstream/presentation/extension_ui/extension_settings_flow.dart';
 
 /// The CloudStream part of the Plugins (Extensions) screen.
 ///
@@ -562,6 +564,30 @@ class _CloudStreamPluginTile extends ConsumerWidget {
                         : null,
                   )
                 else ...[
+                  // v20+44: an installed plugin's own settings screen —
+                  // Kartoons' login lives there ("Get Login Code"), and
+                  // this tile never had the button: the full CloudStream
+                  // screen has it, but Settings no longer links to that
+                  // screen (+37), so it was unreachable. Same gate as that
+                  // screen: the engine says the plugin has a settings
+                  // screen (its `openSettings`), and this platform can
+                  // draw it. The sheet is the plugin's own screen, so its
+                  // login code, polling and token stay the plugin's code.
+                  if (installed.hasSettings == true &&
+                      extensionScreensSupported)
+                    Semantics(
+                      identifier: 'cs3-settings-${info.internalName}',
+                      child: IconButton(
+                        key: ValueKey('cs3_settings_${info.internalName}'),
+                        tooltip: l10n.cloudStreamSettings,
+                        icon: const Icon(Icons.tune_rounded),
+                        onPressed: applying || !on
+                            ? null
+                            : () => unawaited(
+                                openExtensionSettings(context, ref, installed),
+                              ),
+                      ),
+                    ),
                   if (newer != null)
                     IconButton(
                       tooltip: l10n.cloudStreamUpdate,
