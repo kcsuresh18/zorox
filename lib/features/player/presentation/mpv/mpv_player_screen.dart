@@ -834,13 +834,14 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   ///
   /// Runs in [_init] when the viewer turned the setting on. The native
   /// layer is created once, up front, so the button and auto-PiP both
-  /// have a source ready; no frames are enqueued until the window
-  /// actually opens (+29 — before that the layer sits behind Flutter's
-  /// view and any frame in it would show as a second copy of the video
-  /// inside the app). `isSupported` is checked first: a device
-  /// without PiP leaves the bridge null and the button hidden. The
-  /// trailing setState rebuilds once support is known, so the button
-  /// appears on the first play rather than the next rebuild.
+  /// have a source ready; the latest frame is held as a prime in memory
+  /// and pushed into the layer only when a start is attempted (+30 —
+  /// the layer sits above Flutter's rendered view, so any frame in it
+  /// would show as a second copy of the video inside the app, and an
+  /// empty layer refuses to start at all). `isSupported` is checked
+  /// first: a device without PiP leaves the bridge null and the button
+  /// hidden. The trailing setState rebuilds once support is known, so
+  /// the button appears on the first play rather than the next rebuild.
   Future<void> _setupIosMpvPip() async {
     if (defaultTargetPlatform != TargetPlatform.iOS ||
         !_iosMpvPipEnabled) {

@@ -59,7 +59,8 @@ void main() {
             if (call.method == 'enterPip') return true;
             if (call.method == 'diag') {
               return 'layer=2 inWindow=true possible=true '
-                  'audio=playback frames=42';
+                  'audio=playback frames=42 primed=true primeAgeMs=120 '
+                  'primes=3';
             }
             return null;
           });
@@ -167,6 +168,40 @@ void main() {
       expect(reason, contains('possible=false'));
     });
 
+    test(
+      'a failed enterPiP leaves the bridge prepared, so a retry is '
+      'possible (+30)',
+      () async {
+        await preparePip();
+        var attempts = 0;
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(channel, (MethodCall call) async {
+              if (call.method == 'enterPip') {
+                attempts++;
+                // First attempt: the layer held no frame yet (+29).
+                if (attempts == 1) {
+                  throw PlatformException(
+                    code: 'not_possible',
+                    message: 'possible=false primed=false',
+                  );
+                }
+                // Second attempt, after the native prime: opens.
+                return true;
+              }
+              return null;
+            });
+        String? reason;
+        pip.onPipFailed = (r) => reason = r;
+        expect(await pip.enterPiP(), isFalse);
+        expect(reason, contains('primed=false'));
+        // The failure must not tear the bridge down: the retry goes
+        // through the same prepared bridge.
+        expect(pip.isPrepared, isTrue);
+        expect(await pip.enterPiP(), isTrue);
+        expect(attempts, 2);
+      },
+    );
+
     test('exitPiP is a no-op before prepare', () async {
       await pip.exitPiP();
       expect(calls, isEmpty);
@@ -223,7 +258,12 @@ void main() {
 
     test('diag asks the native side', () async {
       await preparePip();
-      expect(await pip.diag, contains('frames=42'));
+      final d = await pip.diag;
+      expect(d, contains('frames=42'));
+      // +30: the diag carries the prime state, so a future "PiP
+      // doesn't open" can be told apart from a layer problem.
+      expect(d, contains('primed=true'));
+      expect(d, contains('primeAgeMs=120'));
     });
 
     test('dispose releases and clears prepared and inPip', () async {

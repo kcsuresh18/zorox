@@ -59,6 +59,25 @@ private final class PipHostView: UIView {
 /// while portrait stayed portrait after the player rotated, and PiP
 /// opened a narrow vertical strip.
 ///
+/// +30: +29's gate broke PiP completely — the window never opens, on
+/// either the button or the home-swipe path. Chicken-and-egg:
+/// startPictureInPicture() refuses while the layer is EMPTY
+/// (isPictureInPicturePossible == false), but pipActive is only set
+/// once PiP WILL start, so no frame is ever enqueued. The +28 build
+/// opened because its ~5 fps trickle kept a frame in the layer. The
+/// fix is a PRIME: the latest frame is held in memory (never enqueued)
+/// and pushed into the layer only at the moment a start is attempted —
+/// synchronously in enter(), and when the app backgrounds (for
+/// auto-PiP), with a flush on become-active if PiP never started.
+/// There is deliberately NO standing trickle: the host view is a
+/// subview of the FlutterView itself, so it renders ABOVE the Metal
+/// layer — any frame in the display layer shows on top of the player
+/// as a second copy. The +28 video proves it: the second copy was
+/// full-width with shifted, clipped subtitles, i.e. the layer's own
+/// video rect on top of the Flutter scene, not Flutter's video showing
+/// through. So the layer stays empty in-app and is primed only when
+/// a start is imminent.
+///
 /// Own channel `dev.akash.skystream.player/pip_mpv_ios` — deliberately NOT
 /// `dev.akash.skystream.player/pip`, which the libVLC side already uses;
 /// reusing that name would replace its handler.
@@ -106,6 +125,28 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   )
   private var frameCount = 0
 
+  // MARK: - Prime (+30)
+  //
+  // The latest rendered frame, held in memory (never enqueued) so a
+  // PiP start always has a frame to push into the layer. Two slots,
+  // ping-pong: ingest() writes only the INACTIVE slot and then swaps
+  // the current pointer under the lock, so a buffer being enqueued by
+  // enter() is never overwritten mid-copy. The slots are plain
+  // CVPixelBuffers (not from the live-feed pool) so holding one can
+  // never starve the live feed. Refreshed at most ~5 fps while the
+  // player runs; a paused film keeps its last frame, which is exactly
+  // the frame PiP should open on.
+  private var primeBuffers: [CVPixelBuffer?] = [nil, nil]
+  private var primeCurrent = 0
+  private var primeReady = false
+  private var primeUpdatedAt: CFAbsoluteTime = 0
+  private var primeW = 0
+  private var primeH = 0
+  private var primeCount = 0
+  private var lastPrimedAt: CFAbsoluteTime = 0
+  private var enterPending = false
+  private var lifecycleObservers: [NSObjectProtocol] = []
+
   init(channel: FlutterMethodChannel) {
     self.channel = channel
     super.init()
@@ -113,6 +154,9 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
 
   deinit {
     if let observer = frameObserver {
+      NotificationCenter.default.removeObserver(observer)
+    }
+    for observer in lifecycleObservers {
       NotificationCenter.default.removeObserver(observer)
     }
   }
@@ -171,11 +215,14 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       let displayLayer = AVSampleBufferDisplayLayer()
       displayLayer.videoGravity = .resizeAspect
 
-      // Full-window host behind Flutter's view, NOT hidden: PiP refuses
-      // to start for a layer that is hidden or outside the window
-      // hierarchy. Flutter's own view sits on top of it, so the layer
-      // never shows inline — it only feeds the PiP window. The host is
-      // a PipHostView (+29) so the layer tracks the window on rotation:
+      // Full-window host, NOT hidden: PiP refuses to start for a layer
+      // that is hidden or outside the window hierarchy. NOTE the host
+      // is a subview of the FlutterView itself, so it renders ABOVE
+      // the Metal layer — the layer is NOT hidden behind Flutter's
+      // view. Any frame in it shows on top of the player as a second
+      // copy (+28). The layer therefore stays EMPTY in-app and is
+      // primed only when a start is imminent (+30). The host is a
+      // PipHostView (+29) so the layer tracks the window on rotation:
       // a plain sublayer keeps the frame it was created with.
       let host = PipHostView(frame: rootView.bounds)
       host.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -231,6 +278,40 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       }
     }
 
+    // +30: auto-PiP is evaluated by the system as the app backgrounds,
+    // with no Dart call in between — the layer must already hold a
+    // frame then. Prime it on resign-active (and again on entering
+    // background, second chance), and flush on become-active if PiP
+    // never started, so no frozen frame lingers on top of the player.
+    // didBecomeActive (not willEnterForeground): resign-active also
+    // fires for transient interruptions (Control Center, a call) where
+    // the app never backgrounds, and only become-active follows those.
+    // Main queue: these notifications arrive there.
+    if lifecycleObservers.isEmpty {
+      let center = NotificationCenter.default
+      lifecycleObservers.append(
+        center.addObserver(
+          forName: UIApplication.willResignActiveNotification,
+          object: nil,
+          queue: .main
+        ) { [weak self] _ in self?.primeForBackground() }
+      )
+      lifecycleObservers.append(
+        center.addObserver(
+          forName: UIApplication.didEnterBackgroundNotification,
+          object: nil,
+          queue: .main
+        ) { [weak self] _ in self?.primeForBackground() }
+      )
+      lifecycleObservers.append(
+        center.addObserver(
+          forName: UIApplication.didBecomeActiveNotification,
+          object: nil,
+          queue: .main
+        ) { [weak self] _ in self?.clearStalePrime() }
+      )
+    }
+
     prepared = true
     return true
   }
@@ -280,15 +361,132 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       result(true)
       return
     }
+    // One enter at a time: a double-tap on the button must not run two
+    // poll loops against the same result callback.
+    lock.lock()
+    let already = enterPending
+    if !already { enterPending = true }
+    lock.unlock()
+    guard !already else {
+      result(
+        FlutterError(code: "busy", message: "PiP start already running", details: nil)
+      )
+      return
+    }
+    syncLayerFrame()
+    // +30: the layer MUST hold a frame before startPictureInPicture —
+    // an empty layer reports isPictureInPicturePossible == false and
+    // the start refuses (the +29 regression). Prime it with the latest
+    // held frame, then poll for possible: the layer processes the
+    // enqueued buffer asynchronously, so possible may flip true a
+    // beat after the enqueue. The Dart side has a 5 s watchdog, so a
+    // ~1 s wait here is safe.
+    attemptEnter(pip: pip, result: result, attemptsLeft: 20)
+  }
+
+  /// One tick of the enter() poll. Prime the layer if a newer held
+  /// frame arrived since the last prime, then start when possible.
+  /// Runs on the main queue (MethodChannel handlers are main-thread).
+  private func attemptEnter(
+    pip: AVPictureInPictureController,
+    result: @escaping FlutterResult,
+    attemptsLeft: Int
+  ) {
+    // Keep the layer's image fresh while we wait: a newer prime
+    // replaces the stale one.
+    if let prime = takePrimeIfNewer() {
+      enqueuePrime(prime)
+    }
+    if pip.isPictureInPictureActive {
+      finishEnter(result: result, success: true)
+      return
+    }
     if pip.isPictureInPicturePossible {
       syncLayerFrame()
       pip.startPictureInPicture()
-      result(true)
+      finishEnter(result: result, success: true)
       return
     }
-    result(
-      FlutterError(code: "not_possible", message: diag(), details: nil)
-    )
+    if attemptsLeft > 0 {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+        guard let self = self else { return }
+        self.attemptEnter(
+          pip: pip,
+          result: result,
+          attemptsLeft: attemptsLeft - 1
+        )
+      }
+      return
+    }
+    // Still impossible after ~1 s: flush the prime so no frozen frame
+    // lingers on top of the player, and report with diag.
+    layer?.flushAndRemoveImage()
+    finishEnter(result: result, success: false)
+  }
+
+  /// Clears the enter guard and answers the MethodChannel call exactly
+  /// once. A failure carries the diag string so a future "PiP doesn't
+  /// open" can be told apart from a layer problem.
+  private func finishEnter(result: @escaping FlutterResult, success: Bool) {
+    lock.lock()
+    enterPending = false
+    lock.unlock()
+    if success {
+      result(true)
+    } else {
+      result(
+        FlutterError(code: "not_possible", message: diag(), details: nil)
+      )
+    }
+  }
+
+  /// Pushes the held prime frame into the display layer, synchronously
+  /// on the calling (main) thread. The prime is copied into a fresh
+  /// pool buffer first: the held slot will be overwritten by a later
+  /// refresh, and the copy must never be torn mid-enqueue. Returns
+  /// false when the layer isn't ready — the caller retries on the next
+  /// poll tick.
+  @discardableResult
+  private func enqueuePrime(_ pb: CVPixelBuffer) -> Bool {
+    guard let layer = layer, layer.isReadyForMoreMediaData else {
+      return false
+    }
+    let w = CVPixelBufferGetWidth(pb)
+    let h = CVPixelBufferGetHeight(pb)
+    guard let dst = makeBuffer(w, h) else { return false }
+    copyFrame(src: pb, dst: dst)
+    enqueue(dst, on: layer)
+    lock.lock()
+    primeCount += 1
+    lastPrimedAt = CFAbsoluteTimeGetCurrent()
+    lock.unlock()
+    return true
+  }
+
+  /// Auto-PiP prime (+30): the system evaluates auto-PiP as the app
+  /// backgrounds, with no Dart call in between — the layer must already
+  /// hold a frame then, or the system silently skips it (the +29
+  /// home-swipe failure). Only while actually playing: a paused film
+  /// never auto-opens, so no prime is needed. The frame is on top of
+  /// the player only while the app is leaving the screen, so the user
+  /// never sees it; clearStalePrime() removes it on foreground return
+  /// if PiP never started.
+  private func primeForBackground() {
+    guard prepared, playing, !pipActive else { return }
+    guard let prime = takePrime(), let layer = layer else { return }
+    syncLayerFrame()
+    enqueuePrime(prime)
+  }
+
+  /// Back active without PiP up: a background prime that never became
+  /// a window would sit on top of the player as a frozen frame. Flush
+  /// it. This also covers transient interruptions (Control Center, a
+  /// call): resign-active primes, become-active follows without any
+  /// foreground transition. Harmless when PiP did start — the live
+  /// feed is already flowing and the flush only clears a stale image.
+  private func clearStalePrime() {
+    guard !pipActive else { return }
+    layer?.flushAndRemoveImage()
   }
 
   private func release() {
@@ -306,11 +504,21 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       NotificationCenter.default.removeObserver(observer)
       frameObserver = nil
     }
+    for observer in lifecycleObservers {
+      NotificationCenter.default.removeObserver(observer)
+    }
+    lifecycleObservers = []
     pool = nil
     lock.lock()
     armed = false
     pipActive = false
     prepared = false
+    primeBuffers = [nil, nil]
+    primeReady = false
+    primeUpdatedAt = 0
+    primeW = 0
+    primeH = 0
+    enterPending = false
     lock.unlock()
   }
 
@@ -329,14 +537,27 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   }
 
   /// Layer status, whether the layer is in a window, whether PiP can
-  /// start, the audio category, and how many frames reached the PiP
-  /// layer — the first thing to check when PiP fails on a phone.
+  /// start, the audio category, how many frames reached the PiP
+  /// layer — and the prime state (+30): whether a frame is held ready
+  /// for a start, how old it is, and how many primes were enqueued.
+  /// The first thing to check when PiP fails on a phone: primed=false
+  /// means no frame ever arrived (renderer tap broken); primed=true
+  /// with possible=false means the layer saw the prime but the
+  /// controller still refuses.
   private func diag() -> String {
-    "layer=\(layer?.status.rawValue ?? -1) "
+    lock.lock()
+    let pReady = primeReady
+    let pAgeMs = primeReady
+      ? Int((CFAbsoluteTimeGetCurrent() - primeUpdatedAt) * 1000)
+      : -1
+    let pCount = primeCount
+    lock.unlock()
+    return "layer=\(layer?.status.rawValue ?? -1) "
       + "inWindow=\(hostView?.window != nil) "
       + "possible=\(pip?.isPictureInPicturePossible ?? false) "
       + "audio=\(AVAudioSession.sharedInstance().category.rawValue) "
-      + "frames=\(frameCount)"
+      + "frames=\(frameCount) "
+      + "primed=\(pReady) primeAgeMs=\(pAgeMs) primes=\(pCount)"
   }
 
   // MARK: - Frame ingest
@@ -347,15 +568,7 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     let isPipActive = pipActive
     let targetLayer = layer
     lock.unlock()
-    // Frames feed the PiP window ONLY while it is actually up (+29):
-    // before PiP opens, and after it stops, the display layer sits
-    // full-window behind Flutter's view — any frame enqueued there
-    // shows as a second copy of the video inside the app. The old
-    // ~5 fps pre-PiP trickle is gone for the same reason. The gate is
-    // driven by the PiP delegate (willStart/didStop), not by the
-    // request, so it covers both the button path and auto-PiP on a
-    // home swipe.
-    guard isArmed, isPipActive, let layer = targetLayer else { return }
+    guard isArmed, let layer = targetLayer else { return }
 
     // The PiP window is small: full-res 1080p frames through the copy
     // + compositor are wasted work and helped saturate the CPU (+29).
@@ -374,11 +587,110 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       th = sh
     }
 
-    guard let dst = makeBuffer(tw, th) else { return }
-    copyFrame(src: pb, dst: dst)
-    frameQueue.async { [weak self] in
-      self?.enqueue(dst, on: layer)
+    // Frames feed the PiP window ONLY while it is actually up (+29):
+    // the host view is a subview of the FlutterView itself, so it
+    // renders ABOVE the Metal layer — any frame enqueued while the app
+    // is in the foreground shows as a second copy of the video inside
+    // the app (the +28 second screen). While PiP is NOT up, the frame
+    // only refreshes the held prime (+30): a copy in memory, never
+    // enqueued, so the layer stays empty in-app and a start always
+    // has a fresh frame to push.
+    if isPipActive {
+      guard let dst = makeBuffer(tw, th) else { return }
+      copyFrame(src: pb, dst: dst)
+      frameQueue.async { [weak self] in
+        self?.enqueue(dst, on: layer)
+      }
+      return
     }
+    refreshPrime(pb, tw: tw, th: th)
+  }
+
+  // MARK: - Prime (+30)
+
+  /// Refreshes the held prime with the latest rendered frame, at most
+  /// ~5 fps. Runs on the media_kit render thread (ingest is called
+  /// synchronously from the frame notification). The copy goes into
+  /// the INACTIVE slot and the swap happens under the lock, so a
+  /// buffer being enqueued by enter() is never overwritten mid-copy.
+  /// One ~640 px vImage scale per 200 ms is negligible next to the
+  /// render work itself.
+  private func refreshPrime(_ pb: CVPixelBuffer, tw: Int, th: Int) {
+    let now = CFAbsoluteTimeGetCurrent()
+    lock.lock()
+    let last = primeUpdatedAt
+    let current = primeCurrent
+    let pw = primeW
+    let ph = primeH
+    let existing = primeBuffers[1 - current]
+    lock.unlock()
+    guard now - last >= 0.2 else { return }
+
+    // Reuse the inactive slot's buffer when it already has the right
+    // size; otherwise create a fresh one. The buffer object is only
+    // ever written here, on the render thread, and the array slot is
+    // assigned under the lock below — so no other thread can observe
+    // a half-written slot.
+    let writeSlot = 1 - current
+    let dst: CVPixelBuffer?
+    if let existing = existing, pw == tw && ph == th {
+      dst = existing
+    } else {
+      dst = createPrimeBuffer(w: tw, h: th)
+    }
+    guard let dst = dst else { return }
+    copyFrame(src: pb, dst: dst)
+    lock.lock()
+    primeBuffers[writeSlot] = dst
+    primeCurrent = writeSlot
+    primeReady = true
+    primeUpdatedAt = now
+    primeW = tw
+    primeH = th
+    lock.unlock()
+  }
+
+  /// The current prime buffer, if one is held. The returned buffer is
+  /// never written again — the next refresh writes the other slot —
+  /// so it is safe to enqueue directly. Callers must NOT hold it
+  /// across a release().
+  private func takePrime() -> CVPixelBuffer? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard primeReady else { return nil }
+    return primeBuffers[primeCurrent]
+  }
+
+  /// The current prime, but only if it is newer than the last one
+  /// enqueued — the enter() poll uses this so it re-primes only when
+  /// a fresher frame arrived while waiting for possible to flip.
+  private func takePrimeIfNewer() -> CVPixelBuffer? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard primeReady, primeUpdatedAt > lastPrimedAt else { return nil }
+    return primeBuffers[primeCurrent]
+  }
+
+  /// A fresh prime-slot buffer, created directly — NOT from the
+  /// live-feed pool, so holding a prime can never starve the live
+  /// feed. IOSurface-backed, like the pool buffers.
+  private func createPrimeBuffer(w: Int, h: Int) -> CVPixelBuffer? {
+    let attrs: [String: Any] = [
+      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+      kCVPixelBufferWidthKey as String: w,
+      kCVPixelBufferHeightKey as String: h,
+      kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
+    ]
+    var out: CVPixelBuffer?
+    guard CVPixelBufferCreate(
+      kCFAllocatorDefault,
+      w,
+      h,
+      kCVPixelFormatType_32BGRA,
+      attrs as CFDictionary,
+      &out
+    ) == kCVReturnSuccess, let buf = out else { return nil }
+    return buf
   }
 
   /// Synchronous copy into our own IOSurface-backed BGRA pool: the
@@ -563,9 +875,10 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   }
 
   /// Stops the PiP feed and empties the display layer (+29): the layer
-  /// sits full-window behind Flutter's view, and a stale frame left in
-  /// it would keep showing as a second copy of the video inside the
-  /// app after PiP stops.
+  /// renders above Flutter's scene, so a stale frame left in it would
+  /// keep showing as a second copy of the video inside the app after
+  /// PiP stops. The prime (+30) is held in memory, not in the layer,
+  /// so the next start re-primes from the next frame arrival.
   private func stopPipFeed() {
     lock.lock()
     pipActive = false

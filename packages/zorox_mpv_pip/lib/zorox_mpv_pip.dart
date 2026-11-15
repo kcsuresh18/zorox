@@ -75,9 +75,12 @@ class MpvPipIos {
   /// Creates the native source layer and arms frame delivery.
   ///
   /// Call once, after the player is created and the media is loaded.
-  /// The native side enqueues no frames until the PiP window actually
-  /// opens (+29); the layer sits behind Flutter's view and a frame in
-  /// it would show as a second copy of the video inside the app.
+  /// The native side holds the latest frame as a prime in memory and
+  /// pushes it into the layer only when a PiP start is attempted (the
+  /// button, or the app backgrounding for auto-PiP) — the layer must
+  /// already hold a frame or the start refuses (+30). The layer stays
+  /// empty in-app: it sits above Flutter's rendered view, so any frame
+  /// in it would show as a second copy of the video inside the app.
   Future<void> prepare({
     required Duration position,
     required Duration duration,
