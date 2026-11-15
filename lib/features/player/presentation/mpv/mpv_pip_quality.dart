@@ -42,6 +42,25 @@ int? pipQualityDropTarget({
   return target;
 }
 
+/// Whether a Home swipe should open the PiP window by itself (+41).
+///
+/// Pure: the screen acts on it in `didChangeAppLifecycleState`
+/// (see `mpv_player_screen.dart`), and the native bridge enforces
+/// the same gates (see `autoEnterPiP` in
+/// `ZoroxMpvPipPlugin.swift`). All three must hold: the PiP setting
+/// is ON and the device supports it ([pipAvailable] — setting OFF
+/// means today's behaviour, no auto-PiP), the film is actually
+/// playing (a paused film going Home never pops a window), and no
+/// window is already up.
+bool shouldAutoEnterPip({
+  required bool pipAvailable,
+  required bool playing,
+  required bool inPip,
+}) {
+  if (!pipAvailable || !playing || inPip) return false;
+  return true;
+}
+
 /// The render-cap target the PiP and thermal caps agree on (+35 P1).
 ///
 /// The PiP cap and the thermal cap share one actuation (the fork's

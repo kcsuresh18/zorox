@@ -421,14 +421,18 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       }
     }
 
-    // +30: auto-PiP is evaluated by the system as the app backgrounds,
-    // with no Dart call in between — the layer must already hold a
-    // frame then. Prime it on resign-active (and again on entering
+    // +30/+41: the layer must already hold a frame when the app
+    // backgrounds, or a start is refused (the +29 home-swipe
+    // failure). Prime it on resign-active (and again on entering
     // background, second chance), and flush on become-active if PiP
     // never started, so no frozen frame lingers on top of the player.
     // didBecomeActive (not willEnterForeground): resign-active also
     // fires for transient interruptions (Control Center, a call) where
     // the app never backgrounds, and only become-active follows those.
+    // +41: entering background also DRIVES the start (see
+    // [autoEnterPiP]) — the canStartPictureInPicture-
+    // AutomaticallyFromInline arm alone never opened the window for
+    // this sample-buffer source, so the start is explicit now.
     // Main queue: these notifications arrive there.
     if lifecycleObservers.isEmpty {
       let center = NotificationCenter.default
@@ -444,7 +448,7 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
           forName: UIApplication.didEnterBackgroundNotification,
           object: nil,
           queue: .main
-        ) { [weak self] _ in self?.primeForBackground() }
+        ) { [weak self] _ in self?.autoEnterPiP() }
       )
       lifecycleObservers.append(
         center.addObserver(
@@ -486,8 +490,12 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       }
       lastAppliedPlaying = playing
     }
-    // Auto-PiP when the app goes to background, only while actually
-    // playing: a paused film never auto-opens.
+    // Auto-PiP arm when the app goes to background, only while
+    // actually playing: a paused film never auto-opens. The flag
+    // alone never opened the window for this sample-buffer source
+    // (+41) — the start itself is driven explicitly from
+    // didEnterBackground (see [autoEnterPiP]); the flag stays as
+    // belt and braces for the system path.
     pip?.canStartPictureInPictureAutomaticallyFromInline = playing
     pip?.invalidatePlaybackState()
   }
@@ -655,6 +663,40 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     guard let prime = takePrime(), let layer = layer else { return }
     syncLayerFrame()
     enqueuePrime(prime)
+  }
+
+  /// Auto-PiP on Home swipe (+41): drive the start explicitly when
+  /// the app enters the background.
+  ///
+  /// The `canStartPictureInPictureAutomaticallyFromInline` arm (see
+  /// [apply]) never opened the window on its own for this
+  /// sample-buffer content source — the system evaluates auto-PiP at
+  /// the background transition, before the primed frame has been
+  /// processed, so `isPictureInPicturePossible` is still false and
+  /// the start is silently skipped (the +29 home-swipe failure,
+  /// still live in +40). So the start is driven here, through the
+  /// same poll loop the button uses ([attemptEnter]): prime, then
+  /// start when possible. The result is discarded — the open is
+  /// reported through the delegate (`pipStarted`), exactly as for
+  /// the button path.
+  ///
+  /// Only while actually playing: a paused film never auto-opens.
+  /// Never while a window is already up, and never while a manual
+  /// enter is running (`enterPending` serializes the two — the Dart
+  /// `hidden` backup, see the screen, can race this).
+  /// didEnterBackground fires only for a real backgrounding (Home,
+  /// the app switcher, lock); transient overlays (Control Center, a
+  /// call) only resign active, so they never reach this.
+  private func autoEnterPiP() {
+    guard prepared, playing, !pipActive else { return }
+    guard let pip = pip, !pip.isPictureInPictureActive else { return }
+    lock.lock()
+    let already = enterPending
+    if !already { enterPending = true }
+    lock.unlock()
+    guard !already else { return }
+    primeForBackground()
+    attemptEnter(pip: pip, result: { _ in }, attemptsLeft: 20)
   }
 
   /// Back active without PiP up: a background prime that never became

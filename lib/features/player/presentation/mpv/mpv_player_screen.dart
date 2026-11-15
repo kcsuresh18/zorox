@@ -679,10 +679,10 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
         // overlay too — Control Center, Notification Center, a call — and
         // starting PiP for one of those would open a window that never
         // should have existed. Leaving the app for real (Home, the app
-        // switcher) is handled natively instead: the bridge arms
-        // `canStartPictureInPictureAutomaticallyFromInline` while the film
-        // is playing (see [_syncIosPipState]), and iOS opens the window
-        // when the app backgrounds. A transient inactive never
+        // switcher) is handled natively instead: the bridge drives the
+        // start explicitly on entering background (see
+        // [ZoroxMpvPipPlugin.autoEnterPiP]), with the Dart `hidden`
+        // branch below as backup. A transient inactive never
         // backgrounds the app, so the window never opens for Control
         // Center. The window opening is reported through `pipStarted`,
         // which is what sets [_inPip].
@@ -697,6 +697,25 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
         if (!_inPip && _pipAvailable && _playing) {
           unawaited(_enterPip());
         }
+      }
+    }
+    if (state == AppLifecycleState.hidden &&
+        defaultTargetPlatform == TargetPlatform.iOS) {
+      // +41 auto-PiP, Dart-side backup behind the native drive (see
+      // [ZoroxMpvPipPlugin.autoEnterPiP] — it normally wins the
+      // race): `hidden` fires only when the app is really
+      // backgrounded. A transient `inactive` (Control Center,
+      // Notification Center, a call) never reaches it, so no overlay
+      // ever pops a window. The enter guard makes a double start
+      // impossible, and the window opening is reported through
+      // `pipStarted` either way. Same gates as the native side, via
+      // the pure decision in [shouldAutoEnterPip].
+      if (shouldAutoEnterPip(
+        pipAvailable: _pipAvailable,
+        playing: _playing,
+        inPip: _inPip,
+      )) {
+        unawaited(_enterIosMpvPip(fromButton: false));
       }
     }
     if (state == AppLifecycleState.resumed) {
