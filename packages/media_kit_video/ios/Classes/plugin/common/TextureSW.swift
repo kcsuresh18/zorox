@@ -26,10 +26,14 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
   // source TRC to sRGB right after mpv renders — both paths then show
   // the same colours, in the app and in the PiP window (which taps
   // this same buffer). Only TRCs that need it (bt.1886 and other pure
-  // powers above 2.2); bt.709/sRGB/HDR are left alone. The TRC is read
-  // once per video size from video-params/gamma; unknown defaults to
-  // bt.1886, the TRC mpv itself guesses for SDR.
+  // powers above 2.2); bt.709/sRGB are left alone, and PQ (HDR) gets a
+  // BT.2390 tone map instead of a gamma fix (see pqToneMapLut, +46).
+  // The TRC is read once per video size from video-params/gamma;
+  // unknown defaults to bt.1886, the TRC mpv itself guesses for SDR.
   private var swLutExponent: Double?
+  /// +46: the file's peak luminance in nits while the PQ tone map is
+  /// active (nil otherwise). Cached per video size next to the exponent.
+  private var swLutPQPeak: Double?
   private var swLutSize: CGSize?
   private var swLut: [UInt8]?
   private static let swLutIdentity: [UInt8] = (0...255).map { UInt8($0) }
@@ -200,7 +204,8 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
   /// The video's transfer function as a pure power (bt.1886 -> 2.4),
   /// or 2.4 when mpv cannot say (no video yet, or an untagged file —
-  /// mpv guesses bt.1886 for SDR itself).
+  /// mpv guesses bt.1886 for SDR itself). PQ is branched off before
+  /// this — see applySwGammaCorrection — so it never reaches here.
   private func readVideoGammaExponent() -> Double {
     guard
       let cStr = mpv_get_property_string(handle, "video-params/gamma")
@@ -220,9 +225,112 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     }
   }
 
+  /// The raw video-params/gamma string ("bt.1886", "pq", ...), or ""
+  /// when mpv cannot say. The exponent reader above maps it to a power;
+  /// the PQ branch needs the name itself.
+  private func readVideoGammaName() -> String {
+    guard
+      let cStr = mpv_get_property_string(handle, "video-params/gamma")
+    else { return "" }
+    defer { mpv_free(cStr) }
+    return String(cString: cStr)
+  }
+
+  /// The file's peak luminance in nits, from video-params/sig-peak.
+  /// mpv reports sig-peak relative to a 100-nit reference, so 10.0
+  /// means a 1,000-nit master. Falls back to 1,000 nits when the
+  /// property is missing or nonsense — the tone map then assumes the
+  /// common 1,000-nit master rather than skipping the correction.
+  private func readSigPeakNits() -> Double {
+    var peak: Double = 0
+    guard
+      mpv_get_property(
+        handle,
+        "video-params/sig-peak",
+        MPV_FORMAT_DOUBLE,
+        &peak
+      ) >= 0,
+      peak.isFinite, peak > 0
+    else { return 1000 }
+    return min(max(peak * 100, 100), 10000)
+  }
+
+  // +46: SMPTE ST 2084 (PQ) constants, shared by pqEncode/pqEotf.
+  private static let pqM1 = 2610.0 / 16384.0
+  private static let pqM2 = 2523.0 / 4096.0 * 128.0
+  private static let pqC1 = 3424.0 / 4096.0
+  private static let pqC2 = 2413.0 / 4096.0 * 32.0
+  private static let pqC3 = 2392.0 / 4096.0 * 32.0
+
+  /// Linear light (0..1, 1 = 10,000 nits) -> PQ code value (ST 2084).
+  private static func pqEncode(_ y: Double) -> Double {
+    let ym = pow(max(0.0, y), pqM1)
+    return pow((pqC1 + pqC2 * ym) / (1.0 + pqC3 * ym), pqM2)
+  }
+
+  /// PQ code value -> linear light (0..1, 1 = 10,000 nits).
+  private static func pqEotf(_ c: Double) -> Double {
+    let cPow = pow(max(0.0, c), 1.0 / pqM2)
+    let den = pqC2 - pqC3 * cPow
+    guard den > 0 else { return 1.0 }
+    return pow(max(0.0, cPow - pqC1) / den, 1.0 / pqM1)
+  }
+
+  /// Linear light relative to display white (0..1) -> sRGB code value.
+  private static func srgbEncode(_ l: Double) -> Double {
+    if l <= 0.0031308 { return 12.92 * l }
+    return 1.055 * pow(l, 1.0 / 2.4) - 0.055
+  }
+
+  /// PQ (HDR) -> SDR tone-mapping LUT: per 8-bit PQ code, BT.2390 EETF
+  /// in PQ space (verified against the reference curve: 100 nits in ->
+  /// ~69 nits out, 1,000 nits in -> 100 nits out, for a 1,000-nit
+  /// master on a 100-nit display) then PQ-decode and sRGB-encode. The
+  /// EETF works on the PQ signal normalised by the mastering white:
+  /// below the knee (KS = 1.5*maxLum - 0.5, maxLum = display peak /
+  /// source peak in PQ code words) the signal passes 1:1, so shadows
+  /// and diffuse white stay bright; above it a Hermite spline rolls
+  /// the highlights off onto the display peak. A naive linear
+  /// scale-to-peak would darken diffuse white to ~35% grey instead.
+  /// HLG is not covered (different curve) — it still falls through to
+  /// no correction.
+  private static func pqToneMapLut(peakNits: Double) -> [UInt8] {
+    let masteringWhite = pqEncode(peakNits / 10000.0)
+    guard masteringWhite > 0 else { return swLutIdentity }
+    let displayWhite = pqEncode(0.01)  // 100 nits, the SDR white
+    let maxLum = min(1.0, displayWhite / masteringWhite)
+    let ks = max(0.0, min(1.0, 1.5 * maxLum - 0.5))
+    return (0...255).map { i in
+      let code = Double(i) / 255.0
+      var p = code / masteringWhite
+      if p > 1.0 { p = 1.0 }
+      let p2: Double
+      if p <= ks || ks >= 1.0 {
+        p2 = p
+      } else {
+        let t = (p - ks) / (1.0 - ks)
+        let t2 = t * t
+        let t3 = t2 * t
+        p2 =
+          (2 * t3 - 3 * t2 + 1) * ks
+          + (t3 - 2 * t2 + t) * (1.0 - ks)
+          + (-2 * t3 + 3 * t2) * maxLum
+      }
+      let newCode = p2 * masteringWhite
+      // Absolute PQ code -> linear light (1.0 = 10,000 nits) -> relative
+      // to the 100-nit SDR white -> sRGB code value.
+      let linear = pqEotf(newCode) / 0.01
+      let s = srgbEncode(min(1.0, max(0.0, linear)))
+      return UInt8(max(0, min(255, (s * 255.0).rounded())))
+    }
+  }
+
   /// Maps the rendered frame's transfer function to sRGB, in place.
-  /// A no-op (apart from one property read per new video size) when
-  /// the source is already sRGB-like or HDR.
+  /// Two cases, decided once per video size: a pure-power TRC (bt.1886
+  /// and friends) gets a power LUT, and PQ (HDR) gets a BT.2390
+  /// tone-mapping LUT (see pqToneMapLut). A no-op (apart from the
+  /// property reads on the first frame of a new size) when the source is
+  /// already sRGB-like, or an HDR curve this does not cover (HLG).
   private func applySwGammaCorrection(
     size: CGSize,
     pitch: Int,
@@ -235,17 +343,31 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     if swLutSize != size {
       swLutSize = size
       swLutExponent = nil
+      swLutPQPeak = nil
       swLut = nil
     }
     if swLutExponent == nil {
-      let source = readVideoGammaExponent()
-      swLutExponent = source > 2.21 ? source / 2.2 : 1.0
+      if readVideoGammaName() == "pq" {
+        // +46: HDR (PQ) — tone-map, don't gamma-correct. The exponent
+        // stays 1.0 as the "decided" marker; the peak rides alongside.
+        swLutPQPeak = readSigPeakNits()
+        swLutExponent = 1.0
+      } else {
+        let source = readVideoGammaExponent()
+        swLutExponent = source > 2.21 ? source / 2.2 : 1.0
+      }
     }
-    guard let exponent = swLutExponent, exponent > 1.0 else { return }
-    if swLut == nil {
-      swLut = (0...255).map { i in
-        let v = pow(Double(i) / 255.0, exponent)
-        return UInt8(max(0, min(255, (v * 255.0).rounded())))
+    if let peak = swLutPQPeak {
+      if swLut == nil {
+        swLut = Self.pqToneMapLut(peakNits: peak)
+      }
+    } else {
+      guard let exponent = swLutExponent, exponent > 1.0 else { return }
+      if swLut == nil {
+        swLut = (0...255).map { i in
+          let v = pow(Double(i) / 255.0, exponent)
+          return UInt8(max(0, min(255, (v * 255.0).rounded())))
+        }
       }
     }
     guard let lut = swLut else { return }

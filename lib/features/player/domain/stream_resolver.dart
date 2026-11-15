@@ -10,6 +10,7 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:collection/collection.dart';
 import 'package:flutter/foundation.dart';
@@ -30,6 +31,7 @@ import '../../../core/extensions/base_provider.dart';
 import '../../../core/extensions/extension_manager.dart';
 import '../../../core/extensions/providers.dart';
 import '../../../core/storage/history_repository.dart';
+import '../../../core/storage/settings_repository.dart';
 import '../../../core/network/http_defaults.dart';
 import '../../../core/network/clearance/clearance.dart';
 import '../../../core/network/probe_answer.dart';
@@ -512,6 +514,39 @@ Future<List<StreamResult>> _byQuality(
   return sortStreamsByQuality(filtered, preference);
 }
 
+/// Stable identity of one source, for remembering the last-played source
+/// per title. The stream URL itself is NOT stable: signed links (DriveSeed
+/// and friends) are re-issued on every load, so the exact-URL match in
+/// [_savedStreamIndex] never hits for them and the title re-opens on
+/// Source 1. The provider label + quality are re-scraped identically on
+/// every load, so they identify the same row. A label that ever changes
+/// just misses and the resolver falls back to Source 1, as before.
+String streamSourceKey(StreamResult stream) =>
+    '${stream.providerName}\u0001${stream.source}\u0001${stream.quality ?? 0}';
+
+/// Hive settings-box key for the per-title last-source map: title URL
+/// (the same identity Continue Watching uses) -> [streamSourceKey].
+const String kLastSourceByTitleKey = 'player_last_source_by_title';
+
+/// The persisted last-source map, or empty when there is none or it is
+/// unreadable. A corrupted box reads as no memory, and the resolver picks
+/// fresh, which is where the viewer would have been anyway.
+Map<String, String> readLastSourceMap(ProviderReader read) {
+  try {
+    final stored = read(
+      settingsRepositoryProvider,
+    ).getPlayerSetting<String>(kLastSourceByTitleKey);
+    if (stored == null || stored.isEmpty) return <String, String>{};
+    final decoded = jsonDecode(stored);
+    if (decoded is! Map) return <String, String>{};
+    return decoded.map(
+      (key, value) => MapEntry(key.toString(), value.toString()),
+    );
+  } catch (_) {
+    return <String, String>{};
+  }
+}
+
 /// The source the user last watched this title on, so switching episodes keeps
 /// the working provider instead of re-picking from scratch.
 int _savedStreamIndex(
@@ -534,6 +569,17 @@ int _savedStreamIndex(
 
     if (lastUrl != null) {
       final found = streams.indexWhere((s) => s.url == lastUrl);
+      if (found != -1) return found;
+    }
+    // +46: the URL match above misses whenever the provider re-issues
+    // signed links (DriveSeed): the last-played source is remembered by
+    // its stable label instead — see [streamSourceKey]. A label that
+    // changed just misses and the title opens on Source 1, as before.
+    final lastKey = readLastSourceMap(read)[item.url];
+    if (lastKey != null) {
+      final found = streams.indexWhere(
+        (s) => streamSourceKey(s) == lastKey,
+      );
       if (found != -1) return found;
     }
   } catch (e) {

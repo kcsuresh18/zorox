@@ -1641,6 +1641,12 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     // drawer on it while the re-application lands.
     if (index != _streamIndex) _adapter.noteNewSource();
     _streamIndex = index;
+    // +46: remember this source for this title, so the next open starts
+    // here instead of on Source 1. The URL is not stored: signed links
+    // change on every load, so the stable label is the key (see
+    // [streamSourceKey]). Saved on every open — manual pick, auto-pick,
+    // failover — because the last-played source is whichever is playing.
+    _rememberSource(_streams[index]);
     _startedPlaying = false;
     _subtitleAppliedFor = -1;
     // The audio-language setting is captured per open (a change in
@@ -2365,6 +2371,24 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       return RememberedTrack.fromJson(jsonDecode(stored));
     } catch (_) {
       return null;
+    }
+  }
+
+  /// Persists the opened source for this title (see [streamSourceKey],
+  /// [readLastSourceMap]). Fire-and-forget, like the audio pick: a write
+  /// that fails just means the next open picks fresh.
+  void _rememberSource(StreamResult stream) {
+    try {
+      final map = readLastSourceMap(ref.read);
+      map[widget.item.url] = streamSourceKey(stream);
+      unawaited(
+        ref.read(settingsRepositoryProvider).setPlayerSetting(
+              kLastSourceByTitleKey,
+              jsonEncode(map),
+            ),
+      );
+    } catch (_) {
+      // No memory is better than a crash mid-open.
     }
   }
 
