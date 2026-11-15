@@ -78,32 +78,50 @@ private final class PipHostView: UIView {
 /// through. So the layer stays empty in-app and is primed only when
 /// a start is imminent.
 ///
-/// +31: the +30 phone test shows PiP OPENS (prime works, window proper
-/// 16:9) but the picture runs at ~1 frame per 5 seconds and the voice
-/// stutters too — the whole mpv pipeline is starved in background, not
-/// just the video gate. The gate IS open (frames do arrive, slowly:
-/// willStart fired, proven by the burned-in subtitle, which mpv only
-/// renders once the Dart side turns sub-visibility on at PiP start),
-/// and the layer is NOT flushed (the "black window" reading was a dark
-/// anime scene — do not chase the flush theory). The cause is per-frame
-/// CPU on threads iOS throttles hard once backgrounded: the software
-/// renderer writes a full-res 1080p frame, ingest() vImage-downscales
-/// it, and enqueue() builds a fresh CMVideoFormatDescription per frame
-/// — while the same throttling starves mpv's audio decoder, hence the
-/// cut-cut voice. Fixes, in order of effect:
-/// (1) the Dart side drops to a <=480p source while PiP is up (the
-/// +27 thermal governor's ladder, reused) and restores on stop — a
-/// 1080p render+downscale is ~5x the work of a 480p one, at the
-/// source, where it counts; (2) enqueue() caches the format
-/// description per dimensions instead of creating one per frame;
-/// (3) ingest() drops a live frame early when the layer's queue is
-/// full, instead of paying the downscale for a frame the layer would
-/// refuse; (4) the gate is also opened in enter() right after
-/// startPictureInPicture() (the delegate still sets it; a failed start
-/// clears it), so the live feed no longer depends on the callback
-/// alone; (5) diag() now counts tap arrivals and live enqueues/drops
-/// with the last live frame's age, so the next phone test can tell
-/// "gate closed" from "no frames" from "frames too slow".
+/// +32: the +31 phone test shows PiP plays ~3 s of real motion and
+/// then runs JERKILY (frames arrive rarely, in bursts; voice stutters
+/// too) — "freeze nahi, atak atak k chalta hein". The user asked
+/// Claude and ChatGPT as well (3-AI approach), and both converged on
+/// the sample-buffer pipeline, NOT the CPU: (1) TIMESTAMPS — the
+/// layer's controlTimebase was anchored to the MOVIE position
+/// (apply() re-set it on every Dart position update, ~5x/s) while
+/// every sample buffer carried a WALL-CLOCK PTS
+/// (CFAbsoluteTimeGetCurrent, seconds since 2001 — ~800M seconds in
+/// the future of the layer's clock), so the layer queued frames and
+/// waited, isReadyForMoreMediaData went false, ingest() dropped
+/// everything, and only an occasional frame slipped through when the
+/// timebase was re-anchored — exactly the jerky trickle. Fix: the
+/// timebase is set ONCE to the host clock in prepare() and re-synced
+/// only on play/pause transitions; the PTS is the host clock
+/// (CMClockGetTime), DisplayImmediately kept. (2) UNBOUNDED QUEUE —
+/// ingest() checked isReady BEFORE the copy and the async hop, so
+/// frames piled up in frameQueue while the layer fell behind, and the
+/// pool's "minimum 3" is a minimum, not a maximum, so it gave no
+/// backpressure at all. Fix: ONE in-flight live frame
+/// (DispatchSemaphore, non-blocking wait), a session-generation
+/// counter so frames queued before a stop can't enter the next
+/// session, and the pool minimum raised to 8. (3) THREAD OWNERSHIP —
+/// the layer was touched from three threads (render thread, frame
+/// queue, main). Fix: the display layer is main-only now; ingest()
+/// copies on the render thread (the tap contract) and hands the
+/// buffer to the main queue, never main.sync. (4) SILENT .failed —
+/// enqueue() flushed a failed layer and then enqueued into it anyway.
+/// Fix: on .failed, log layer.error, flush, DROP the frame and count
+/// it, so the next frame is the recovery attempt. (5) DIAGNOSTICS —
+/// a native 1 s snapshot (NSLog, not a Dart timer) while PiP is up,
+/// and diag() extended with pool/layer/PTS-delta counters, so the
+/// next phone test names the cause. Secondary: the render worker
+/// runs .userInteractive (fork Worker.swift), the live feed's serial
+/// queue is gone (main owns the layer), and a latency-critical
+/// activity assertion is held for the PiP lifetime (cheap insurance;
+/// the audio background mode is what keeps the app alive). The 480p
+/// drop stays (ceiling 360p in +32, Dart side) with the thermal
+/// stand-down. What +32 deliberately does NOT do: a second mpv render
+/// context or a native render worker decoupled from Flutter (the
+/// stretch goal both AIs named) — that is the next round if the
+/// pipeline fix alone is not enough; neither does it chase the
+/// layer-flush theory (the window never went black) or the gate
+/// (proven open by the burned-in subtitle).
 ///
 /// Own channel `dev.akash.skystream.player/pip_mpv_ios` — deliberately NOT
 /// `dev.akash.skystream.player/pip`, which the libVLC side already uses;
@@ -147,10 +165,72 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   private var pool: CVPixelBufferPool?
   private var poolW = 0
   private var poolH = 0
-  private let frameQueue = DispatchQueue(
-    label: "dev.akash.skystream.pip.frame"
-  )
   private var frameCount = 0
+
+  // +32: ONE in-flight live frame. ingest() runs on the media_kit
+  // render thread and must never block, so the wait is non-blocking
+  // (timeout .now()): if a previous frame is still being handed to
+  // the layer, the new one drops. The semaphore is signalled on the
+  // main queue after the hand-off (or the drop) completes — see
+  // ingest()/enqueue(). Before +32 the readiness check happened
+  // BEFORE the copy and the async hop, so frames piled up in
+  // frameQueue while the layer fell behind, and the pool's "minimum
+  // 3" is a minimum, not a maximum, so it gave no backpressure at
+  // all. There is no frameQueue anymore: the display layer is
+  // main-only (see enqueue()), and ingest() hands the copied buffer
+  // straight to the main queue.
+  private let liveSemaphore = DispatchSemaphore(value: 1)
+
+  // +32: session generation. Bumped on every session boundary
+  // (enter, stop, release) so a frame queued before PiP stopped —
+  // or before a new attempt — can never enter a later session: the
+  // main-queue hand-off drops it when the generation it captured no
+  // longer matches.
+  private var sessionGeneration = 0
+
+  // +32: pool pressure. makeBuffer() used to ignore the pool's return
+  // code; a pool that cannot allocate (all buffers held by the layer)
+  // now counts here, with the last status, so the next phone test can
+  // tell pool exhaustion apart from layer backpressure.
+  private var poolFailed = 0
+  private var lastPoolStatus: Int32 = 0
+
+  // +32: how many times enqueue() found the layer .failed, and the
+  // PTS-vs-layer-clock delta of the last enqueued frame, in ms. The
+  // delta is the smoking gun for the +31 timestamp bug: before +32
+  // the PTS was wall-clock (~800M s) against a movie-position
+  // timebase, so it read in the hundreds of millions of seconds.
+  // After the fix it should be ~0.
+  private var layerFailed = 0
+  private var lastPtsDeltaMs: Int64 = 0
+
+  // +32: the fork's render counters, carried in the tap
+  // notification's userInfo (see MediaKitFrameTap.swift) — how many
+  // mpv update callbacks fired, how many renders completed, and how
+  // long the last render took. If ingest() grows but these don't,
+  // the tap is the problem; if the update count grows but the render
+  // count doesn't, the Worker/main hop is.
+  private var lastUpdateCount = 0
+  private var lastRenderCount = 0
+  private var lastRenderMs: Double = 0
+
+  // +32: the native 1 s diag snapshot (NSLog, not a Dart timer — the
+  // Flutter isolate may be suspended in background). Runs only while
+  // PiP is up; see startDiagSnapshot()/stopDiagSnapshot().
+  private var diagTimer: Timer?
+
+  // +32: a latency-critical activity assertion for the PiP lifetime.
+  // Cheap insurance that the system schedules this process's work
+  // promptly while the window is up; the audio background mode is
+  // what keeps the app alive. Held from PiP start to PiP stop.
+  private var pipActivity: NSObjectProtocol?
+
+  // +32: the playing state apply() last saw, so the timebase is only
+  // re-synced on a genuine play/pause transition — never on the
+  // ~5x/s position updates. Before +32, apply() re-anchored the
+  // timebase to the movie position on EVERY updateState, a
+  // discontinuity five times a second.
+  private var lastAppliedPlaying = false
 
   // +31: throughput counters for diag() — how many frames the tap
   // delivered, how many reached the layer while PiP was up, how many
@@ -281,6 +361,19 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       // means PiP cannot be prepared.
       guard let tb = try? CMTimebase(masterClock: CMClockGetHostTimeClock())
       else { return false }
+      // +32: the timebase is anchored to the HOST clock ONCE, here,
+      // and runs at rate 1 — it is the same timeline the sample
+      // buffers' PTS use (see enqueue()). Before +32, apply()
+      // re-anchored it to the MOVIE position on every Dart position
+      // update (~5x/s) while the PTS was wall-clock, so the layer
+      // queued frames ~800M seconds in its future and waited. The
+      // only later re-sync is a genuine play/pause transition in
+      // apply(); a stream re-open never touches it.
+      CMTimebaseSetTime(
+        tb,
+        time: CMClockGetTime(CMClockGetHostTimeClock())
+      )
+      CMTimebaseSetRate(tb, rate: 1)
       displayLayer.controlTimebase = tb
 
       let source = AVPictureInPictureController.ContentSource(
@@ -307,6 +400,9 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     // queue: nil delivers synchronously on the posting thread — the
     // media_kit worker thread that just rendered the frame — so the
     // copy in ingest() reads the buffer before the renderer reuses it.
+    // +32: the tap also carries the fork's render counters in
+    // userInfo (see MediaKitFrameTap.swift); the 1 s snapshot prints
+    // them, so a stall can be told apart as renderer vs pipeline.
     if frameObserver == nil {
       frameObserver = NotificationCenter.default.addObserver(
         forName: Self.frameNotification,
@@ -319,6 +415,7 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
         guard let obj = note.object,
               CFGetTypeID(obj as CFTypeRef) == CVPixelBufferGetTypeID()
         else { return }
+        self?.noteRenderCounters(note.userInfo)
         self?.ingest(obj as! CVPixelBuffer)
       }
     }
@@ -367,12 +464,26 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     playing = (args["playing"] as? Bool) ?? false
     rate = args["rate"] != nil ? num(args, "rate") : 1.0
 
-    if let tb = timebase {
-      CMTimebaseSetTime(
-        tb,
-        time: CMTime(seconds: max(lastPosition, 0), preferredTimescale: 1000)
-      )
-      CMTimebaseSetRate(tb, rate: playing ? rate : 0)
+    // +32: the timebase is a HOST-clock clock (set once in
+    // prepare()), so it is NEVER re-anchored to the movie position
+    // here — before +32 this ran on every Dart position update
+    // (~5x/s) and moved the layer's clock under the queued frames.
+    // Only a genuine play/pause transition touches it: on pause the
+    // clock stops, on resume it re-syncs to host-now and runs again.
+    // The movie position is irrelevant to the layer once the PTS is
+    // host-clocked (see enqueue()); the PiP scrubber reads the
+    // timeRange delegate, not this clock.
+    if let tb = timebase, playing != lastAppliedPlaying {
+      if playing {
+        CMTimebaseSetTime(
+          tb,
+          time: CMClockGetTime(CMClockGetHostTimeClock())
+        )
+        CMTimebaseSetRate(tb, rate: rate)
+      } else {
+        CMTimebaseSetRate(tb, rate: 0)
+      }
+      lastAppliedPlaying = playing
     }
     // Auto-PiP when the app goes to background, only while actually
     // playing: a paused film never auto-opens.
@@ -419,6 +530,13 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       return
     }
     syncLayerFrame()
+    // +32: a new attempt is a new session — any live frame queued
+    // before this (e.g. from a previous PiP session that just
+    // stopped) must not enter it; the main-queue hand-off drops
+    // frames whose generation no longer matches.
+    lock.lock()
+    sessionGeneration += 1
+    lock.unlock()
     // +30: the layer MUST hold a frame before startPictureInPicture —
     // an empty layer reports isPictureInPicturePossible == false and
     // the start refuses (the +29 regression). Prime it with the latest
@@ -457,6 +575,11 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       lock.lock()
       pipActive = true
       lock.unlock()
+      // +32: the PiP lifetime starts here (willStart repeats these
+      // calls harmlessly if it fires too): the activity assertion
+      // and the 1 s native diag snapshot.
+      beginPipActivity()
+      startDiagSnapshot()
       finishEnter(result: result, success: true)
       return
     }
@@ -508,7 +631,9 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     let h = CVPixelBufferGetHeight(pb)
     guard let dst = makeBuffer(w, h) else { return false }
     copyFrame(src: pb, dst: dst)
-    enqueue(dst, on: layer)
+    // +32: enqueue() is main-only now and takes the layer from self;
+    // this runs on main already (enter poll / lifecycle observers).
+    enqueue(dst)
     lock.lock()
     primeCount += 1
     lastPrimedAt = CFAbsoluteTimeGetCurrent()
@@ -543,6 +668,8 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   }
 
   private func release() {
+    stopDiagSnapshot()
+    endPipActivity()
     pip?.stopPictureInPicture()
     pip = nil
     timebase = nil
@@ -579,6 +706,15 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     cachedFormatDesc = nil
     cachedFormatW = 0
     cachedFormatH = 0
+    sessionGeneration += 1
+    poolFailed = 0
+    lastPoolStatus = 0
+    layerFailed = 0
+    lastPtsDeltaMs = 0
+    lastUpdateCount = 0
+    lastRenderCount = 0
+    lastRenderMs = 0
+    lastAppliedPlaying = false
     lock.unlock()
   }
 
@@ -611,6 +747,14 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   /// in the seconds (the +30 phone test: ~5000 ms) while pipActive
   /// is true; a closed gate reads as pipActive=false with liveEnq
   /// stuck at 0.
+  /// +32: also the pool pressure (poolFail, lastPoolStatus — 0 is
+  /// success, -6683 is would-exceed-allocation-threshold), the layer
+  /// failures (layerFail + the layer's error), the PTS-vs-layer-clock
+  /// delta (ptsDeltaMs — ~0 after the timestamp fix; hundreds of
+  /// millions of seconds before it), and the fork's render counters
+  /// (upd/rend/rendMs — if ingest grows but upd/rend don't, the tap
+  /// is the problem; if upd grows but rend doesn't, the Worker/main
+  /// hop is).
   private func diag() -> String {
     lock.lock()
     let pReady = primeReady
@@ -625,7 +769,15 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     let liveAgeMs = lastLiveEnqueueAt > 0
       ? Int((CFAbsoluteTimeGetCurrent() - lastLiveEnqueueAt) * 1000)
       : -1
+    let pFail = poolFailed
+    let pStatus = lastPoolStatus
+    let lFail = layerFailed
+    let ptsDelta = lastPtsDeltaMs
+    let upd = lastUpdateCount
+    let rend = lastRenderCount
+    let rendMs = lastRenderMs
     lock.unlock()
+    let layerErr = (layer?.error as? NSError)?.localizedDescription ?? "none"
     return "layer=\(layer?.status.rawValue ?? -1) "
       + "inWindow=\(hostView?.window != nil) "
       + "possible=\(pip?.isPictureInPicturePossible ?? false) "
@@ -634,7 +786,11 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       + "frames=\(frameCount) "
       + "ingest=\(ingested) liveEnq=\(enqueued) liveDrop=\(dropped) "
       + "liveAgeMs=\(liveAgeMs) "
-      + "primed=\(pReady) primeAgeMs=\(pAgeMs) primes=\(pCount)"
+      + "primed=\(pReady) primeAgeMs=\(pAgeMs) primes=\(pCount) "
+      + "poolFail=\(pFail) poolStatus=\(pStatus) "
+      + "layerFail=\(lFail) layerErr=\(layerErr) "
+      + "ptsDeltaMs=\(ptsDelta) "
+      + "upd=\(upd) rend=\(rend) rendMs=\(String(format: "%.1f", rendMs))"
   }
 
   // MARK: - Frame ingest
@@ -643,10 +799,10 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     lock.lock()
     let isArmed = armed
     let isPipActive = pipActive
-    let targetLayer = layer
+    let generation = sessionGeneration
     ingestCount += 1
     lock.unlock()
-    guard isArmed, let layer = targetLayer else { return }
+    guard isArmed else { return }
 
     // The PiP window is small: full-res 1080p frames through the copy
     // + compositor are wasted work and helped saturate the CPU (+29).
@@ -674,20 +830,51 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     // enqueued, so the layer stays empty in-app and a start always
     // has a fresh frame to push.
     if isPipActive {
-      // +31: drop early when the layer's queue is full — the copy for
-      // a frame the layer would refuse is wasted CPU on the throttled
-      // background render thread, and the layer already holds frames.
-      if !layer.isReadyForMoreMediaData {
+      // +32: ONE in-flight live frame. The semaphore wait is
+      // NON-BLOCKING (timeout .now()) — this runs on the media_kit
+      // render thread and must never block it. If the previous frame
+      // is still being handed to the layer, this one drops. The
+      // isReadyForMoreMediaData pre-check that used to live here is
+      // gone: it read a main-actor layer from the render thread, and
+      // it ran BEFORE the copy and the async hop, so it could not
+      // stop frames piling up behind a slow layer anyway. The
+      // backpressure is now the semaphore (here) plus the readiness
+      // check inside enqueue() on the main queue (there).
+      guard liveSemaphore.wait(timeout: .now()) == .success else {
         noteLiveDrop()
         return
       }
       guard let dst = makeBuffer(tw, th) else {
+        // Pool could not allocate (all buffers held by the layer):
+        // count it and release the slot — never retry in a loop on
+        // the render thread.
+        lock.lock()
+        poolFailed += 1
+        lock.unlock()
+        liveSemaphore.signal()
         noteLiveDrop()
         return
       }
+      // Synchronous copy on the render thread: the tap contract —
+      // the renderer reuses its buffer on the next render. The
+      // hand-off to the layer then goes to the main queue (the layer
+      // is main-only); the semaphore is released there, in the
+      // hand-off's defer, so a slow main queue — not a queue of
+      // frames — is what throttles the tap. The semaphore is captured
+      // strongly (it is a let): the slot is released even if the
+      // plugin is gone by the time the hand-off runs.
       copyFrame(src: pb, dst: dst)
-      frameQueue.async { [weak self] in
-        self?.enqueue(dst, on: layer, live: true)
+      let semaphore = liveSemaphore
+      DispatchQueue.main.async { [weak self] in
+        defer { semaphore.signal() }
+        guard let self = self else { return }
+        // A frame queued before PiP stopped (or before a new attempt)
+        // must not enter the next session.
+        self.lock.lock()
+        let current = self.sessionGeneration
+        self.lock.unlock()
+        guard current == generation else { return }
+        self.enqueue(dst, live: true)
       }
       return
     }
@@ -846,9 +1033,15 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
         kCVPixelBufferIOSurfacePropertiesKey as String: [String: Any](),
       ]
       var p: CVPixelBufferPool?
+      // +32: minimum 8 buffers, not 3 — the layer can hold buffers
+      // while backgrounded, and a 3-buffer pool runs dry the moment
+      // the layer is a beat slow to release. (The minimum is a
+      // minimum, not a maximum: Core Video allocates beyond it, so
+      // this is headroom, not a hard bound — the hard bound is the
+      // one-in-flight semaphore in ingest().)
       CVPixelBufferPoolCreate(
         kCFAllocatorDefault,
-        [kCVPixelBufferPoolMinimumBufferCountKey as String: 3] as CFDictionary,
+        [kCVPixelBufferPoolMinimumBufferCountKey as String: 8] as CFDictionary,
         attrs as CFDictionary,
         &p
       )
@@ -858,11 +1051,17 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     }
     guard let pool = pool else { return nil }
     var out: CVPixelBuffer?
-    return CVPixelBufferPoolCreatePixelBuffer(
+    // +32: record the return code — kCVReturnWouldExceedAllocationThreshold
+    // means the pool is under pressure (buffers held by the layer);
+    // any other failure is a different fault. Never retry in a loop
+    // on the render thread.
+    let status = CVPixelBufferPoolCreatePixelBuffer(
       kCFAllocatorDefault,
       pool,
       &out
-    ) == kCVReturnSuccess ? out : nil
+    )
+    lastPoolStatus = status
+    return status == kCVReturnSuccess ? out : nil
   }
 
   /// One dropped live frame, for diag(). A live frame is one enqueued
@@ -871,6 +1070,65 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     lock.lock()
     liveDropped += 1
     lock.unlock()
+  }
+
+  /// Records the fork's render counters from a tap notification's
+  /// userInfo (+32; see MediaKitFrameTap.swift). Runs on the media_kit
+  /// render thread, like ingest() — the lock keeps the snapshot and
+  /// diag() consistent.
+  private func noteRenderCounters(_ userInfo: [AnyHashable: Any]?) {
+    guard let info = userInfo else { return }
+    lock.lock()
+    if let v = info["updateCount"] as? Int { lastUpdateCount = v }
+    if let v = info["renderCount"] as? Int { lastRenderCount = v }
+    if let v = info["renderMs"] as? Double { lastRenderMs = v }
+    lock.unlock()
+  }
+
+  /// Holds a latency-critical activity assertion for the PiP lifetime
+  /// (+32). Cheap insurance that the system schedules this process's
+  /// work promptly while the window is up; the audio background mode
+  /// is what keeps the app alive. Idempotent — a second begin while
+  /// one is held is a no-op.
+  private func beginPipActivity() {
+    guard pipActivity == nil else { return }
+    pipActivity = ProcessInfo.processInfo.beginActivity(
+      options: [.userInitiated, .latencyCritical],
+      reason: "ZoroX PiP"
+    )
+  }
+
+  private func endPipActivity() {
+    guard let activity = pipActivity else { return }
+    pipActivity = nil
+    ProcessInfo.processInfo.endActivity(activity)
+  }
+
+  /// Starts the native 1 s diag snapshot (+32): a compact diag() via
+  /// NSLog every second while PiP is up. Native, not a Dart timer —
+  /// the Flutter isolate may be suspended in background, and the
+  /// snapshot is the record the next phone test is read against:
+  /// ingest flat = tap/renderer stopped; liveEnq flat while ingest
+  /// grows = backpressure/pool/layer; liveAgeMs in seconds with
+  /// liveEnq growing = the layer is eating frames but not showing
+  /// them (then layer status/error and ptsDeltaMs name it).
+  /// Idempotent; runs on the main runloop (all callers are main).
+  private func startDiagSnapshot() {
+    guard diagTimer == nil else { return }
+    diagTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) {
+      [weak self] _ in
+      guard let self = self else { return }
+      self.lock.lock()
+      let active = self.pipActive
+      self.lock.unlock()
+      guard active else { return }
+      NSLog("[pip] snap \(self.diag())")
+    }
+  }
+
+  private func stopDiagSnapshot() {
+    diagTimer?.invalidate()
+    diagTimer = nil
   }
 
   /// The format description for a frame's dimensions, cached (+31):
@@ -903,12 +1161,42 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     return fd
   }
 
+  /// Enqueues one frame into the display layer. MAIN QUEUE ONLY
+  /// (+32): AVSampleBufferDisplayLayer is main-actor isolated, and
+  /// before +32 it was touched from three threads (render thread,
+  /// frame queue, main). Every caller runs on main — the live feed
+  /// via DispatchQueue.main.async from ingest(), the prime from the
+  /// enter poll / lifecycle observers — so this is asserted in debug
+  /// builds rather than silently tolerated.
   private func enqueue(
     _ pb: CVPixelBuffer,
-    on layer: AVSampleBufferDisplayLayer,
     live: Bool = false
   ) {
-    if layer.status == .failed { layer.flush() }
+    assert(
+      Thread.isMainThread,
+      "ZoroxMpvPipPlugin.enqueue must run on the main queue"
+    )
+    guard let layer = layer else {
+      if live { noteLiveDrop() }
+      return
+    }
+    // +32: a failed layer ignores enqueue while still showing the
+    // last frame — exactly a freeze. Log the error, flush, DROP this
+    // frame and count it: the next frame is the recovery attempt.
+    // Before +32 the code flushed and then enqueued into the failed
+    // layer anyway, on every frame. If the layer never recovers,
+    // layerFailed grows in diag() and the next round recreates it.
+    if layer.status == .failed {
+      if let err = layer.error {
+        NSLog("ZoroX PiP: layer failed: \(err)")
+      }
+      layer.flush()
+      lock.lock()
+      layerFailed += 1
+      lock.unlock()
+      if live { noteLiveDrop() }
+      return
+    }
     // Drop rather than queue up: a backlog would show stale frames and
     // grow without bound while the renderer is not ready.
     guard layer.isReadyForMoreMediaData else {
@@ -919,12 +1207,28 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       if live { noteLiveDrop() }
       return
     }
+    // +32: the PTS is the HOST clock — the same timeline the layer's
+    // controlTimebase runs on (set once in prepare(), re-synced only
+    // on play/pause transitions). Before +32 it was
+    // CFAbsoluteTimeGetCurrent() against a timebase anchored to the
+    // MOVIE position: every frame was ~800M seconds in the layer's
+    // future, so the layer queued it and waited, isReadyForMoreMediaData
+    // went false, and ingest() dropped everything — the jerky trickle
+    // of the +31 phone test. The delta is recorded for diag(): it
+    // should read ~0 ms now.
+    let hostNow = CMClockGetTime(CMClockGetHostTimeClock())
+    if let tb = timebase {
+      let layerNow = CMTimebaseGetTime(tb)
+      let deltaMs = Int64(
+        (hostNow.seconds - layerNow.seconds) * 1000
+      )
+      lock.lock()
+      lastPtsDeltaMs = deltaMs
+      lock.unlock()
+    }
     var timing = CMSampleTimingInfo(
       duration: .invalid,
-      presentationTimeStamp: CMTime(
-        seconds: CFAbsoluteTimeGetCurrent(),
-        preferredTimescale: 1000
-      ),
+      presentationTimeStamp: hostNow,
       decodeTimeStamp: .invalid
     )
     var sb: CMSampleBuffer?
@@ -977,6 +1281,12 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     lock.lock()
     pipActive = true
     lock.unlock()
+    // +32: the auto-PiP path reaches here without enter(), so the
+    // activity assertion and the diag snapshot start here too (the
+    // button path already started them in attemptEnter; both helpers
+    // are idempotent).
+    beginPipActivity()
+    startDiagSnapshot()
   }
 
   public func pictureInPictureControllerDidStartPictureInPicture(
@@ -1018,9 +1328,15 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   /// keep showing as a second copy of the video inside the app after
   /// PiP stops. The prime (+30) is held in memory, not in the layer,
   /// so the next start re-primes from the next frame arrival.
+  /// +32: bumps the session generation (a queued live frame must not
+  /// enter the next session), ends the activity assertion and the
+  /// diag snapshot.
   private func stopPipFeed() {
+    stopDiagSnapshot()
+    endPipActivity()
     lock.lock()
     pipActive = false
+    sessionGeneration += 1
     let targetLayer = layer
     lock.unlock()
     targetLayer?.flushAndRemoveImage()

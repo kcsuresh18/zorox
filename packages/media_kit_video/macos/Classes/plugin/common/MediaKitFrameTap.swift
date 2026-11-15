@@ -22,3 +22,49 @@ public extension Notification.Name {
     "ZoroXMpvRenderedFrame",
   )
 }
+
+/// Lock-guarded counters for the software render loop (+32, ZoroX).
+///
+/// The PiP plugin reads these from the frame tap's userInfo and prints
+/// them in its 1 s native diag snapshot, so a stall can be told apart
+/// as renderer vs pipeline: if the mpv update count grows but the
+/// render count doesn't, the Worker/main hop is the problem; if the
+/// render count grows but the plugin's ingest count doesn't, the tap
+/// is. Diagnostic only — written from mpv's callback thread and the
+/// media_kit worker thread, read from the render thread, so the state
+/// lives behind a lock. A single shared instance: the class reference
+/// is a `let` and the mutable state is locked, so it is safe to touch
+/// from any thread (Swift 6 concurrency-safe by construction).
+public final class ZoroXMpvRenderStats {
+  public static let shared = ZoroXMpvRenderStats()
+
+  private let lock = NSLock()
+  private var updateCount = 0
+  private var renderCount = 0
+  private var lastRenderMs: Double = 0
+
+  private init() {}
+
+  public func noteUpdate() {
+    lock.lock()
+    defer { lock.unlock() }
+    updateCount += 1
+  }
+
+  public func noteRender(durationMs: Double) {
+    lock.lock()
+    defer { lock.unlock() }
+    renderCount += 1
+    lastRenderMs = durationMs
+  }
+
+  public func snapshot() -> [String: Any] {
+    lock.lock()
+    defer { lock.unlock() }
+    return [
+      "updateCount": updateCount,
+      "renderCount": renderCount,
+      "renderMs": lastRenderMs,
+    ]
+  }
+}

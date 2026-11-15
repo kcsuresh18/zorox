@@ -16,10 +16,10 @@ library;
 
 import 'mpv_thermal_quality.dart';
 
-/// The tallest stream PiP plays: 480p. A 1080p render+downscale is
-/// ~5x the work of a 480p one; 720p would be ~2.25x. The window is
-/// small, so the extra softness over 720p is invisible.
-const int kPipMaxHeight = 480;
+/// The tallest stream PiP plays: 360p. A 1080p render+downscale is
+/// ~9x the work of a 360p one; 480p would be ~1.8x. The window is
+/// small, so the extra softness over 480p is invisible.
+const int kPipMaxHeight = 360;
 
 /// The stream to drop to while PiP is up, or null when no drop is
 /// wanted: already at or below the ceiling, an adaptive (HLS) master

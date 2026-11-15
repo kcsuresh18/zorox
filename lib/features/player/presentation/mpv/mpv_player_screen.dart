@@ -997,9 +997,9 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// full-res frames plus the tap's downscale cannot keep up (the
   /// same throttling starves mpv's audio decoder, hence the voice).
   /// The fix is to cut the work at the source: the tallest stream at
-  /// or below 480p (see `pipQualityDropTarget`), re-opened at the
+  /// or below 360p (see `pipQualityDropTarget`), re-opened at the
   /// playhead by the same [_pickSource] a tap on a source row makes.
-  /// The PiP window is small, so 480p is plenty, and the original
+  /// The PiP window is small, so 360p is plenty, and the original
   /// stream comes back on PiP stop (see `_restoreQualityAfterPip`).
   /// No-op when there is nothing to drop to (already light, an HLS
   /// master with no ladder, or no lighter stream) or when a drop is
@@ -1040,15 +1040,24 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
 
   /// Starts the iOS mpv PiP diag log (+31): a tick every 5 s while the
   /// window is up, logging the native diag string (gate + throughput).
-  /// debugPrint only. Cancelled on PiP stop (see the onPipStopped
-  /// handler) and in dispose.
+  /// The suffix (+32) is the stream actually playing — 'adaptive' for
+  /// an HLS master with no ladder, where the quality drop is a no-op
+  /// and the render stays full-res: the phone test proves whether the
+  /// drop happened. debugPrint only. Cancelled on PiP stop (see the
+  /// onPipStopped handler) and in dispose.
   void _startPipDiagLog() {
     _pipDiagTimer?.cancel();
     _pipDiagTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
       if (_disposed) return;
       final diag = await _iosPip?.diag;
       if (diag == null || diag.isEmpty) return;
-      if (kDebugMode) debugPrint('[pip] diag: $diag');
+      final quality =
+          _streamIndex >= 0 && _streamIndex < _streams.length
+              ? _streams[_streamIndex].quality
+              : null;
+      final qualityLabel =
+          quality != null && quality > 0 ? '${quality}h' : 'adaptive';
+      if (kDebugMode) debugPrint('[pip] diag: $diag | quality=$qualityLabel');
     });
   }
 

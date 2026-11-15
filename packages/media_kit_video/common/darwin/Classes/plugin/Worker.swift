@@ -10,6 +10,11 @@ class Worker {
 
   init() {
     thread = Thread(block: loop)
+    // +32 (ZoroX): the render thread. A plain Thread runs at default
+    // QoS; the software render is the heaviest work in the process
+    // and iOS throttles backgrounded apps hard, so the thread that
+    // renders (and taps) frames for PiP runs user-interactive.
+    thread.qualityOfService = .userInteractive
     thread.start()
   }
 

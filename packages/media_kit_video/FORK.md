@@ -28,6 +28,21 @@ one of a 3-buffer pool, so the observer must copy it synchronously — the
 PiP plugin (`packages/zorox_mpv_pip`) does exactly that into its own
 IOSurface-backed BGRA pool.
 
+## +32 — render counters in the tap, Worker QoS
+
+- `MediaKitFrameTap.swift`: new `ZoroXMpvRenderStats` (lock-guarded,
+  shared) — mpv update-callback count, render count, last render
+  duration in ms. The tap posts the snapshot in the notification's
+  userInfo so the PiP plugin's 1 s native diag can tell a renderer
+  stall apart from a pipeline stall.
+- `TextureSW` (same three copies): the mpv update callback calls
+  `noteUpdate()`; `render(_:)` times the `mpv_render_context_render`
+  call and calls `noteRender(durationMs:)`.
+- `Worker.swift` (same three copies): the render thread runs at
+  `.userInteractive` QoS instead of default — the software render is
+  the heaviest work in the process and iOS throttles backgrounded
+  apps hard.
+
 ## Updating
 
 To rebase onto a newer media_kit_video: copy the new version over this
