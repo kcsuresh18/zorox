@@ -27,8 +27,13 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
   // the same colours, in the app and in the PiP window (which taps
   // this same buffer). Only TRCs that need it (bt.1886 and other pure
   // powers above 2.2); bt.709/sRGB are left alone, and HDR gets a
-  // BT.2390 tone map instead of a gamma fix — PQ (see pqToneMapLut,
-  // +46) and HLG (see hlgToneMapLut, +47), each with its own decode.
+  // hard clip at the 100-nit SDR white instead of a gamma fix — the
+  // same curve as the hardware path's `tone-mapping: clip` — PQ (see
+  // pqToneMapLut, +46, clip since +50) and HLG (see hlgToneMapLut,
+  // +47, clip since +50), each with its own decode. (+50: the +46/+47
+  // BT.2390 EETF rolled diffuse white off and made PiP ON ~11%
+  // darker than PiP OFF on HDR files; a clip matches the hardware
+  // path exactly.)
   // The TRC is read once per video size from video-params/gamma;
   // unknown defaults to bt.1886, the TRC mpv itself guesses for SDR.
   private var swLutExponent: Double?
@@ -285,62 +290,26 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     return 1.055 * pow(l, 1.0 / 2.4) - 0.055
   }
 
-  /// BT.2390 EETF (Hermite highlight roll-off) on a PQ code, in the
-  /// +46 pqToneMapLut's normalised form: `code` is a PQ code value
-  /// (0..1), `masteringWhite` the PQ code of the source peak,
-  /// `maxLum` the display peak / source peak in PQ code words, `ks`
-  /// the knee. Returns the tone-mapped PQ code. Shared by the PQ LUT
-  /// and the HLG LUT (+47), so both HDR curves roll highlights off
-  /// identically.
-  private static func toneMapPQCode(
-    _ code: Double,
-    masteringWhite: Double,
-    maxLum: Double,
-    ks: Double
-  ) -> Double {
-    var p = code / masteringWhite
-    if p > 1.0 { p = 1.0 }
-    let p2: Double
-    if p <= ks || ks >= 1.0 {
-      p2 = p
-    } else {
-      let t = (p - ks) / (1.0 - ks)
-      let t2 = t * t
-      let t3 = t2 * t
-      p2 =
-        (2 * t3 - 3 * t2 + 1) * ks
-        + (t3 - 2 * t2 + t) * (1.0 - ks)
-        + (-2 * t3 + 3 * t2) * maxLum
-    }
-    return p2 * masteringWhite
-  }
-
-  /// PQ (HDR) -> SDR tone-mapping LUT: per 8-bit PQ code, BT.2390 EETF
-  /// in PQ space (verified against the reference curve: 100 nits in ->
-  /// ~69 nits out, 1,000 nits in -> 100 nits out, for a 1,000-nit
-  /// master on a 100-nit display) then PQ-decode and sRGB-encode. The
-  /// EETF works on the PQ signal normalised by the mastering white:
-  /// below the knee (KS = 1.5*maxLum - 0.5, maxLum = display peak /
-  /// source peak in PQ code words) the signal passes 1:1, so shadows
-  /// and diffuse white stay bright; above it a Hermite spline rolls
-  /// the highlights off onto the display peak. A naive linear
-  /// scale-to-peak would darken diffuse white to ~35% grey instead.
-  /// HLG has its own LUT (see hlgToneMapLut, +47) — same EETF,
-  /// different decode.
+  /// PQ (HDR) -> SDR tone-mapping LUT: per 8-bit PQ code, a hard clip
+  /// at the 100-nit SDR white — the same curve as the hardware path's
+  /// `tone-mapping: clip` (see kMpvIosOptions). +46 used a BT.2390
+  /// EETF here instead, but the EETF rolled diffuse white off
+  /// (100 nits in -> ~0.84 sRGB on SW vs ~0.97 on HW for a 1,000-nit
+  /// master) so PiP ON looked ~11% darker than PiP OFF on HDR files
+  /// (user proof 2026-11-16, Avengers Endgame 4K). A clip matches
+  /// the hardware path exactly; the EETF's highlight roll-off is
+  /// what the hardware path does not do. PQ is absolute, so the clip
+  /// does not depend on the mastering peak — `peakNits` is unused
+  /// (kept in the signature so the PQ/HLG call sites stay
+  /// symmetric). HLG has its own LUT (see hlgToneMapLut, +47) —
+  /// same clip, different decode.
   private static func pqToneMapLut(peakNits: Double) -> [UInt8] {
-    let masteringWhite = pqEncode(peakNits / 10000.0)
-    guard masteringWhite > 0 else { return swLutIdentity }
+    _ = peakNits
     let displayWhite = pqEncode(0.01)  // 100 nits, the SDR white
-    let maxLum = min(1.0, displayWhite / masteringWhite)
-    let ks = max(0.0, min(1.0, 1.5 * maxLum - 0.5))
     return (0...255).map { i in
       let code = Double(i) / 255.0
-      let newCode = toneMapPQCode(
-        code,
-        masteringWhite: masteringWhite,
-        maxLum: maxLum,
-        ks: ks
-      )
+      // Absolute PQ code, clipped at the display white.
+      let newCode = min(code, displayWhite)
       // Absolute PQ code -> linear light (1.0 = 10,000 nits) -> relative
       // to the 100-nit SDR white -> sRGB code value.
       let linear = pqEotf(newCode) / 0.01
@@ -366,47 +335,38 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
   /// HLG (HDR) -> SDR tone-mapping LUT: per 8-bit HLG code, inverse
   /// HLG OETF to scene-linear light, the reference HLG OOTF gamma
-  /// (1.2) to display-linear light, scale by the mastering peak, then
-  /// the same BT.2390 EETF as the PQ LUT (via toneMapPQCode — the
-  /// HLG-derived light is PQ-encoded first, so both HDR curves roll
-  /// highlights off identically) and sRGB-encode. HLG is
+  /// (1.2) to display-linear light, scale by the mastering peak,
+  /// then a hard clip at the 100-nit SDR white — the same curve as
+  /// the hardware path's `tone-mapping: clip` (see pqToneMapLut for
+  /// why the +47 BT.2390 EETF was replaced in +50: it darkened
+  /// diffuse white relative to the hardware path). HLG is
   /// scene-referred where PQ is absolute, so it needs its own decode
-  /// — reusing the PQ LUT's code values directly would be wrong — but
-  /// the tone-mapping curve is shared. Verified numerically (see the
-  /// +47 report): black -> 0, HLG mid (0.5) -> ~182, diffuse white
-  /// (0.75) -> ~242, peak -> 255, monotonic.
+  /// — reusing the PQ LUT's code values directly would be wrong —
+  /// but the tone-mapping curve is shared. Verified numerically (see
+  /// the +50 report): black -> 0, HLG mid (0.5) -> ~189, diffuse
+  /// white (0.75) -> 255, peak -> 255, monotonic.
   private static func hlgToneMapLut(peakNits: Double) -> [UInt8] {
-    let masteringWhite = pqEncode(peakNits / 10000.0)
-    guard masteringWhite > 0 else { return swLutIdentity }
-    let displayWhite = pqEncode(0.01)  // 100 nits, the SDR white
-    let maxLum = min(1.0, displayWhite / masteringWhite)
-    let ks = max(0.0, min(1.0, 1.5 * maxLum - 0.5))
     return (0...255).map { i in
       let ePrime = Double(i) / 255.0
       let sceneLinear = hlgInverseOetf(ePrime)
       let displayLinear = pow(max(0.0, sceneLinear), 1.2)
       let nits = displayLinear * peakNits
-      let code = pqEncode(min(1.0, max(0.0, nits / 10000.0)))
-      let newCode = toneMapPQCode(
-        code,
-        masteringWhite: masteringWhite,
-        maxLum: maxLum,
-        ks: ks
-      )
-      let linear = pqEotf(newCode) / 0.01
-      let s = srgbEncode(min(1.0, max(0.0, linear)))
+      // Hard clip at the 100-nit SDR white.
+      let linear = min(1.0, max(0.0, nits / 100.0))
+      let s = srgbEncode(linear)
       return UInt8(max(0, min(255, (s * 255.0).rounded())))
     }
   }
 
   /// Maps the rendered frame's transfer function to sRGB, in place.
   /// Three cases, decided once per video size: a pure-power TRC
-  /// (bt.1886 and friends) gets a power LUT, PQ (HDR) gets a BT.2390
-  /// tone-mapping LUT (see pqToneMapLut), and HLG (HDR) gets its own
-  /// BT.2390 tone-mapping LUT (see hlgToneMapLut, +47). A no-op (apart
-  /// from the property reads on the first frame of a new size) when
-  /// the source is already sRGB-like, or an HDR/log curve this does
-  /// not cover.
+  /// (bt.1886 and friends) gets a power LUT, PQ (HDR) gets a
+  /// hard-clip LUT (see pqToneMapLut), and HLG (HDR) gets its own
+  /// hard-clip LUT (see hlgToneMapLut, +47). The clip is the same
+  /// curve as the hardware path's `tone-mapping: clip`, so PiP ON
+  /// and PiP OFF match. A no-op (apart from the property reads on
+  /// the first frame of a new size) when the source is already
+  /// sRGB-like, or an HDR/log curve this does not cover.
   private func applySwGammaCorrection(
     size: CGSize,
     pitch: Int,

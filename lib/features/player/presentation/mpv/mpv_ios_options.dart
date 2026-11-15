@@ -145,14 +145,23 @@ bool hwdecSessionLost({required String current}) {
 /// Only when the player was actually background-paused: PiP keeps
 /// decoding (no pause, nothing stale), an open landing re-syncs on its
 /// own, and a film that never started has no position to re-open at.
-/// Pure, so it is unit-tested (see `mpv_resume_resync_test.dart`).
+/// +50: `wasBackgrounded` — the re-open is only for a REAL
+/// backgrounding (the app passed through `paused`/`hidden` before this
+/// `resumed`). A transient `inactive` (Control Center, Notification
+/// Center, a call banner) returns to `resumed` without ever
+/// backgrounding — the decoder and the socket were never suspended,
+/// so re-opening would restart the film for nothing (user proof
+/// 2026-11-16, The Odyssey: Control Center pull-down → 00:00/LIVE
+/// restart). Pure, so it is unit-tested (see `mpv_resume_resync_test.dart`).
 bool shouldResyncDecoderOnResume({
+  required bool wasBackgrounded,
   required bool pipEnabled,
   required bool inPip,
   required bool awaitingPrebuffer,
   required bool startedPlaying,
   required bool hasStream,
 }) =>
+    wasBackgrounded &&
     !pipEnabled &&
     !inPip &&
     !awaitingPrebuffer &&

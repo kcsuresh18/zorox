@@ -330,6 +330,15 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// [_waitForPrebuffer], so a normal open always plays.
   bool _prebufferHoldPlay = false;
 
+  /// +50: true once the app has passed through a real background state
+  /// (`paused`/`hidden`) since the last `resumed`. The +49 resume
+  /// re-open must only fire after a real backgrounding: a transient
+  /// `inactive` (Control Center, Notification Center, a call) returns
+  /// to `resumed` without ever backgrounding, and re-opening for one
+  /// restarts the film for nothing. Set in [didChangeAppLifecycleState];
+  /// consumed (and cleared) on every `resumed`.
+  bool _appWasBackgrounded = false;
+
   /// The pre-buffer target and hold cap for the open source, set in
   /// [_openStream]: the ordinary [_kPrebufferTarget]/[_kPrebufferMaxWait],
   /// or the high-bitrate pair for a 4K open (see
@@ -733,6 +742,14 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       // is already gone by the time the app is foregrounded, so there is
       // no native stop to send — just take the chrome back.
       final wasInPip = _inPip;
+      // +50: consume the backgrounded flag (see [_appWasBackgrounded]):
+      // the resume re-open below runs only after a REAL backgrounding
+      // (paused/hidden → resumed). A transient inactive (Control
+      // Center, Notification Center) returns to resumed with the flag
+      // clear, so the film is left alone. Cleared on every resumed so
+      // a stale backgrounding can never fire a later re-open.
+      final wasBackgrounded = _appWasBackgrounded;
+      _appWasBackgrounded = false;
       if (_inPip) {
         _pipWatchdog?.cancel();
         _pipWatchdog = null;
@@ -760,8 +777,11 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       // iOS only, PiP OFF only: PiP keeps decoding, so there is
       // nothing stale to re-open. P4 stands down while paused, so it
       // cannot double-fire a re-open here.
+      // +50: gated on a real backgrounding (see [wasBackgrounded]
+      // above) — a Control Center pull-down must not re-open.
       if (defaultTargetPlatform == TargetPlatform.iOS &&
           shouldResyncDecoderOnResume(
+            wasBackgrounded: wasBackgrounded,
             pipEnabled: _iosMpvPipEnabled,
             inPip: wasInPip,
             awaitingPrebuffer: _awaitingPrebuffer,
@@ -782,6 +802,10 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     // app goes away is the one Continue Watching must have.
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
+      // +50: a real backgrounding (not a transient inactive) — the
+      // next `resumed` may run the resume re-open (see
+      // [_appWasBackgrounded]).
+      _appWasBackgrounded = true;
       _flushProgress();
     }
   }
