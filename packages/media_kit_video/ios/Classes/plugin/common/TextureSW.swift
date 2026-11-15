@@ -265,7 +265,10 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
           lutPtr.baseAddress,
           lutPtr.baseAddress,
           idPtr.baseAddress,
-          kvImageNoFlags
+          // +45: kvImageNoFlags imports into Swift as Int, but this
+          // parameter is vImage_Flags (UInt32) — the bare constant does
+          // not convert, so wrap it (the standard vImage Swift idiom).
+          vImage_Flags(kvImageNoFlags)
         )
       }
     }
