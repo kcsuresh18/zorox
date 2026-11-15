@@ -423,9 +423,22 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
 
     // +30/+41: the layer must already hold a frame when the app
     // backgrounds, or a start is refused (the +29 home-swipe
-    // failure). Prime it on resign-active (and again on entering
-    // background, second chance), and flush on become-active if PiP
-    // never started, so no frozen frame lingers on top of the player.
+    // failure). Prime it on entering background (see [autoEnterPiP],
+    // which primes + polls for the start), and flush on become-active
+    // if PiP never started, so no frozen frame lingers on top of the
+    // player.
+    // +51: do NOT prime on resign-active. It fires for transient
+    // interruptions (Control Center, Notification Center, a call)
+    // where the app never backgrounds — and the primed frame renders
+    // ON TOP of the Flutter player (the host is a subview of
+    // FlutterView, above the Metal layer), showing as a second,
+    // wrong-aspect copy (a thin strip) in the middle of the screen
+    // for ~1 s after the overlay is dismissed, until the
+    // become-active flush clears it. The prime is only needed when
+    // the app actually backgrounds, and that is covered by
+    // autoEnterPiP on didEnterBackground; manual enter primes via
+    // attemptEnter independently. So there is no resign-active
+    // observer at all.
     // didBecomeActive (not willEnterForeground): resign-active also
     // fires for transient interruptions (Control Center, a call) where
     // the app never backgrounds, and only become-active follows those.
@@ -436,13 +449,6 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     // Main queue: these notifications arrive there.
     if lifecycleObservers.isEmpty {
       let center = NotificationCenter.default
-      lifecycleObservers.append(
-        center.addObserver(
-          forName: UIApplication.willResignActiveNotification,
-          object: nil,
-          queue: .main
-        ) { [weak self] _ in self?.primeForBackground() }
-      )
       lifecycleObservers.append(
         center.addObserver(
           forName: UIApplication.didEnterBackgroundNotification,
@@ -654,8 +660,11 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   /// backgrounds, with no Dart call in between — the layer must already
   /// hold a frame then, or the system silently skips it (the +29
   /// home-swipe failure). Only while actually playing: a paused film
-  /// never auto-opens, so no prime is needed. The frame is on top of
-  /// the player only while the app is leaving the screen, so the user
+  /// never auto-opens, so no prime is needed. Called ONLY from
+  /// autoEnterPiP on didEnterBackground (+51: never on resign-active —
+  /// a transient interruption primes a frame the user then sees on
+  /// top of the player as a thin strip). The frame is on top of the
+  /// player only while the app is leaving the screen, so the user
   /// never sees it; clearStalePrime() removes it on foreground return
   /// if PiP never started.
   private func primeForBackground() {
