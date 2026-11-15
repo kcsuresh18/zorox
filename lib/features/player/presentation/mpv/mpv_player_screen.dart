@@ -389,6 +389,17 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// `_onThermalTick`), so neither can cancel the other's episode.
   int? _pipDroppedFrom;
 
+  /// Whether the PiP render cap (+35 P1) is in effect: the SW render
+  /// target is capped at 1920x1080 while the iOS PiP window is up.
+  /// Tracked apart from the thermal governor's own lightened state —
+  /// the two caps share one actuation ([_setIosRenderCap]), so the
+  /// target is always the min of the two (see [pipRenderCapTarget]):
+  /// the PiP restore on stop must not clobber a thermal lighten, and
+  /// a thermal unlighten during PiP must not raise the PiP cap (see
+  /// [_clearThermalLighten]). False when PiP is down or the source is
+  /// at or below 1080p (nothing to cap).
+  bool _pipRenderCapped = false;
+
   /// Where the open source started (its resume point, else zero): the
   /// pre-buffer cushion is measured from here, not from the stream start.
   Duration _openStart = Duration.zero;
@@ -919,6 +930,11 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       _dropQualityForPip();
       _startPipDiagLog();
       if (!_inPip) setState(() => _inPip = true);
+      // +35 P1: cap the SW render target while the window is up (see
+      // [_applyPipRenderCap]) — full 4K software render in the
+      // background, under iOS CPU throttling, is what lags the PiP
+      // window. No toast: the cap is not a heat event.
+      unawaited(_applyPipRenderCap());
     };
     pip.onPipStopped = (restored) {
       if (!mounted || _disposed) return;
@@ -928,6 +944,10 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       // +31: back to the stream PiP started on (see
       // `_restoreQualityAfterPip`).
       _restoreQualityAfterPip();
+      // +35 P1: PiP is down — restore the render cap to the
+      // governor's desired state (see [_restorePipRenderCap]): a
+      // thermal lighten keeps 1080p, otherwise full size returns.
+      unawaited(_restorePipRenderCap());
       _pipWatchdog?.cancel();
       _pipWatchdog = null;
       if (_inPip) setState(() => _inPip = false);
@@ -1329,7 +1349,10 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
             // re-apply it now that the new stream's parameters are
             // known (first frame is playing).
             unawaited(_logMpvPlaybackStats('BASELINE'));
-            if (_thermalGovernor.isLightened) {
+            // +35 P1: the fork re-requests full size on a video-
+            // parameter change, so a source change while PiP is up
+            // would silently drop the PiP cap — re-apply it here too.
+            if (_thermalGovernor.isLightened || _pipRenderCapped) {
               unawaited(_setIosRenderCap(true));
             }
             // The stats overlay (+34): the same values, live on screen
@@ -1851,6 +1874,56 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     }
   }
 
+  /// The height of the stream now playing, or null when unknown (an
+  /// adaptive master with no ladder height) or no stream is selected.
+  /// The PiP render cap (+35 P1) only ever engages for a known height
+  /// above 1080p — unknown is treated as "nothing to cap", the same
+  /// conservatism as the thermal governor.
+  int? get _currentStreamHeight {
+    if (_streamIndex < 0 || _streamIndex >= _streams.length) return null;
+    return _streams[_streamIndex].quality;
+  }
+
+  /// Applies the PiP render cap (+35 P1): while the iOS PiP window is
+  /// up the whole session runs on the software renderer, and a full
+  /// 4K SW render in the background under iOS CPU throttling cannot
+  /// keep up — so the render target drops to 1920x1080 (a quarter of
+  /// the pixels; the feed is ~640 px wide, so nothing visible is
+  /// lost). The decision is the pure [pipRenderCapTarget]: the PiP cap
+  /// and the thermal cap share one actuation ([_setIosRenderCap]), so
+  /// the target is the min of the two. No toast — the cap is not a
+  /// heat event. No-op when already capped or when the source is at
+  /// or below 1080p.
+  Future<void> _applyPipRenderCap() async {
+    if (_pipRenderCapped) return;
+    final target = pipRenderCapTarget(
+      pipUp: true,
+      thermalLightened: _thermalGovernor.isLightened,
+      sourceHeight: _currentStreamHeight ?? 0,
+    );
+    if (target != PipRenderCap.capped1080p) return;
+    if (await _setIosRenderCap(true)) {
+      _pipRenderCapped = true;
+    }
+  }
+
+  /// Lifts the PiP render cap (+35 P1) now the window is down, and
+  /// restores the render target to the governor's desired state: if
+  /// the thermal governor is lightened the 1080p cap stays
+  /// (re-applied — the PiP restore must never clobber a thermal
+  /// lighten); otherwise full size returns. No-op when the PiP cap
+  /// was never applied.
+  Future<void> _restorePipRenderCap() async {
+    if (!_pipRenderCapped) return;
+    _pipRenderCapped = false;
+    final target = pipRenderCapTarget(
+      pipUp: false,
+      thermalLightened: _thermalGovernor.isLightened,
+      sourceHeight: _currentStreamHeight ?? 0,
+    );
+    await _setIosRenderCap(target == PipRenderCap.capped1080p);
+  }
+
   /// The iOS render cap (+34): caps the native render target at
   /// 1920x1080 through the fork's `VideoController.setSize`, or restores
   /// the native video-params size with a no-arg call. Returns whether
@@ -1914,6 +1987,13 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// stream itself is light now). Returns whether the restore actually
   /// applied, same contract as [_applyThermalLighten].
   Future<bool> _clearThermalLighten() async {
+    // +35 P1: while the PiP cap is up the render stays at 1080p even
+    // when the phone cools — the thermal restore must not raise the
+    // PiP cap (take the min). The cap lifts on PiP stop instead (see
+    // [_restorePipRenderCap]). Returning false also keeps the "back
+    // to full detail" toast silent, which is correct: the detail
+    // stays reduced while PiP is up.
+    if (_pipRenderCapped) return false;
     await _logMpvPlaybackStats('BEFORE UNLIGHTEN');
     final bool cleared;
     if (defaultTargetPlatform == TargetPlatform.iOS) {

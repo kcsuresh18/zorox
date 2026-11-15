@@ -41,3 +41,36 @@ int? pipQualityDropTarget({
   if (target == null || target == currentIndex) return null;
   return target;
 }
+
+/// The render-cap target the PiP and thermal caps agree on (+35 P1).
+///
+/// The PiP cap and the thermal cap share one actuation (the fork's
+/// `VideoController.setSize` — see `_setIosRenderCap` in
+/// `mpv_player_screen.dart`), so the target is always the min of the
+/// two: either one wanting 1080p keeps 1080p; only both clear restores
+/// full size. 960x540 is the later tuning step if the phone test
+/// still lags in PiP — it is deliberately NOT a variant here.
+enum PipRenderCap {
+  /// Render at the source's native size.
+  full,
+
+  /// Cap the render target at 1920x1080.
+  capped1080p,
+}
+
+/// The render-cap target for the current PiP/thermal state (+35 P1).
+///
+/// Pure: the screen acts on it (see `_applyPipRenderCap` /
+/// `_restorePipRenderCap` in `mpv_player_screen.dart`). Sources at or
+/// below 1080p never cap — there is nothing to shrink — and an unknown
+/// height (`0`, e.g. an adaptive master) is treated the same way, the
+/// same conservatism as the thermal governor.
+PipRenderCap pipRenderCapTarget({
+  required bool pipUp,
+  required bool thermalLightened,
+  required int sourceHeight,
+}) {
+  if (sourceHeight <= 1080) return PipRenderCap.full;
+  if (pipUp || thermalLightened) return PipRenderCap.capped1080p;
+  return PipRenderCap.full;
+}
