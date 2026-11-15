@@ -13,8 +13,16 @@
 /// work and the phone can cool; restore the original when it stays
 /// nominal for a minute. A single-file source has no lighter stream to
 /// drop to (+33: the 20.96 GB 4K file), so there the governor lightens
-/// the render instead — `vf` scale to 1080p plus the fast-decode
-/// options — and takes it off on the same 2-nominal-polls rule.
+/// the render instead — and takes it off on the same 2-nominal-polls
+/// rule. The lightening's actuation is split by platform (+34): on iOS
+/// the screen caps the render target to 1920x1080 through
+/// `VideoController.setSize` (see `mpv_player_screen.dart`); on Android
+/// the screen applies the `vf` scale + lavc options below. The split
+/// exists because the +33 `vf` lighten was unreliable on iOS: under
+/// zero-copy videotoolbox a `vf=scale` forces a GPU→CPU download, a CPU
+/// scale and a re-upload (a net loss), `vd-lavc-fast` is MPEG-1/2 and
+/// H.264 only (a no-op on the HEVC file), and `vd-lavc-skiploopfilter`
+/// is ignored under VideoToolbox hardware decode.
 ///
 /// The governor is pure: it decides, the player screen acts. It keeps
 /// the drop episode's state — what it dropped from and to, the nominal
@@ -45,10 +53,11 @@ enum ThermalQualityKind {
   hint,
 
   /// No stream switch: lighten the render of the stream now playing
-  /// (see [kThermalLightenVf] / [kThermalLightenProperties]) — the
-  /// single-file answer. A single-file direct link has no ladder, so
-  /// [drop] is impossible there; the render is lightened instead, and
-  /// [unlighten] takes it off when the phone cools.
+  /// (see [ThermalQualityKind.lighten] actuation: the iOS setSize render
+  /// cap, or [kThermalLightenProperties] on Android) — the single-file
+  /// answer. A single-file direct link has no ladder, so [drop] is
+  /// impossible there; the render is lightened instead, and [unlighten]
+  /// takes it off when the phone cools.
   lighten,
 
   /// Remove the render lightening [lighten] put on.
@@ -57,29 +66,41 @@ enum ThermalQualityKind {
 
 /// The render lightening the governor asks for on a single-file source
 /// (see [ThermalQualityKind.lighten]): downscale the video filter chain
-/// to 1080p, so the render — software in PiP, tone-mapping on the GPU
-/// in normal playback — has a quarter of the pixels to chew. Only for a
-/// stream taller than [ThermalQualityGovernor.dropAboveHeight]; a light
+/// to 1080p, so the render has a quarter of the pixels to chew. Only for
+/// a stream taller than [ThermalQualityGovernor.dropAboveHeight]; a light
 /// stream needs no lightening.
+///
+/// +34: this filter is the ANDROID lighten actuation only. On iOS the
+/// screen caps the render target through `VideoController.setSize`
+/// instead — a `vf=scale` under zero-copy videotoolbox forces a
+/// GPU→CPU download, a CPU scale and a re-upload, which can be a net
+/// loss versus the GPU renderer's own downscale.
 const String kThermalLightenVf = 'scale=-2:1080';
 
-/// The mpv properties the lighten response sets, as `option → value`,
-/// and the values that clear them again. `vd-lavc-skiploopfilter` and
-/// `vd-lavc-fast` are a hedge for the case the VideoToolbox session is
-/// lost and decode is software (the +27 root cause): harmless while
-/// hardware decode is alive, a big saving while it is not. `vf` is the
-/// part that always helps — it re-inits the filter chain at once, no
+/// The mpv properties the lighten response sets on Android, as `option →
+/// value`, and the values that clear them again. `vd-lavc-skiploopfilter`
+/// and `vd-lavc-fast` are a hedge for the case the hardware decoder
+/// session is lost and decode is software: harmless while hardware
+/// decode is alive, a saving while it is not. `vf` is the part that
+/// always helps on Android — it re-inits the filter chain at once, no
 /// re-open needed. Verified against mpv's option list: `vf` is a
 /// runtime property, `vd-lavc-skiploopfilter` takes
 /// none/default/nonref/bidir/nonkey/all, `vd-lavc-fast` is a flag.
+///
+/// On iOS these properties are NOT applied (+34): `vd-lavc-fast` is
+/// MPEG-1/2 and H.264 only (a no-op on the HEVC 4K file),
+/// `vd-lavc-skiploopfilter` is ignored under VideoToolbox hardware
+/// decode, and `vf=scale` under zero-copy videotoolbox forces the
+/// download/scale/re-upload round trip. iOS lightens through the
+/// setSize render cap instead (see `mpv_player_screen.dart`).
 const Map<String, String> kThermalLightenProperties = <String, String>{
   'vf': kThermalLightenVf,
   'vd-lavc-skiploopfilter': 'all',
   'vd-lavc-fast': 'yes',
 };
 
-/// The values that undo [kThermalLightenProperties]: an empty filter
-/// chain, and the lavc defaults.
+/// The values that undo [kThermalLightenProperties] on Android: an empty
+/// filter chain, and the lavc defaults.
 const Map<String, String> kThermalUnlightenProperties = <String, String>{
   'vf': '',
   'vd-lavc-skiploopfilter': 'default',

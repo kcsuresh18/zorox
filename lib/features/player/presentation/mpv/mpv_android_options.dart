@@ -31,14 +31,25 @@
 ///          panel switches rates as the viewer watches, so vdrop juddered
 ///          on every switch. A presentation option; it cannot blank the
 ///          picture.
-///        * `framedrop: decoder+vo` — when the decoder or the video
-///          output cannot keep up, drop frames instead of letting A/V
-///          drift grow. Same safety as above.
+///        * `framedrop: vo` — mpv's recommended mode (+34, was
+///          `decoder+vo`): when the video output cannot keep up, drop
+///          frames instead of letting A/V drift grow. mpv's manual
+///          calls `vo` "the recommended mode, and the default" and
+///          says `decoder+vo` is "Not recommended".
 ///        * `hwdec-software-fallback: 300` — Nuvio's value (the safest
 ///          of its options): if the hardware decoder glitches
 ///          transiently, keep hardware decoding for 300 frames while
 ///          FFmpeg recreates the session, instead of dropping to
 ///          software decode for the rest of the file.
+///        * `demuxer-max-bytes: 256MiB` (+34) — the network cache's
+///          byte cap (default 150 MiB); a bigger headroom rides out
+///          throughput dips without a cache stall. Costs only RAM.
+///        * The cheap GPU render layer (+34): `scale` / `cscale` /
+///          `dscale: bilinear` (fastest scaler; defaults lanczos /
+///          hermite), `deband: no`, `dither-depth: no`,
+///          `correct-downscaling: no`, `tone-mapping: clip` (cheapest
+///          HDR mapping). gl_video options, so they apply to the GPU
+///          render path; the cost is a little picture quality.
 ///
 /// [logMpvDecodeInfo] is the lightweight diagnostic: one debugPrint of
 /// the decoder actually engaged (`hwdec-current`) and the video codec,
@@ -74,9 +85,11 @@ String mpvHwdecForPlatform(TargetPlatform platform) {
 ///
 ///   * `hdr-compute-peak: yes` — the v20+1 black-screen cause. media_kit
 ///     forces it to `no` with `vo=libmpv`; enabling it blanks the video
-///     and stalls the player. NEVER retry.
-///   * `tone-mapping`, `target-colorspace-hint` — Nuvio's HDR path; not
-///     needed for the Android lag and out of scope here.
+///     and stalls the player. NEVER retry. (`tone-mapping: clip` IS in
+///     the map — it is not peak compute, it only picks the mapping
+///     curve, and peak compute stays off.)
+///   * `target-colorspace-hint` — Nuvio's HDR path; not needed for the
+///     Android lag and out of scope here.
 ///   * `vo`, `gpu-api`, `gpu-context` — media_kit owns the video output
 ///     (`vo=gpu` + `gpu-context=android` on Android, `vo=libmpv` on
 ///     iOS); changing it breaks the Flutter texture.
@@ -90,8 +103,16 @@ const Map<String, String> kMpvAndroidOptions = <String, String>{
   // The pitch shift is a fraction of a percent and inaudible. iOS is
   // untouched — its path is smooth as it is.
   'video-sync': 'display-resample',
-  'framedrop': 'decoder+vo',
+  'framedrop': 'vo',
   'hwdec-software-fallback': '300',
+  'demuxer-max-bytes': '256MiB',
+  'scale': 'bilinear',
+  'cscale': 'bilinear',
+  'dscale': 'bilinear',
+  'deband': 'no',
+  'dither-depth': 'no',
+  'correct-downscaling': 'no',
+  'tone-mapping': 'clip',
 };
 
 /// Applies [kMpvAndroidOptions] to a player's mpv instance, then reads

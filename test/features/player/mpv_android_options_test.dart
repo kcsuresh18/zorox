@@ -30,15 +30,29 @@ void main() {
   group('kMpvAndroidOptions', () {
     test('carries the safe presentation options', () {
       expect(kMpvAndroidOptions['video-sync'], 'display-resample');
-      expect(kMpvAndroidOptions['framedrop'], 'decoder+vo');
+      // +34: mpv's manual calls `vo` "the recommended mode, and the
+      // default" and says `decoder+vo` is "Not recommended".
+      expect(kMpvAndroidOptions['framedrop'], 'vo');
       expect(kMpvAndroidOptions['hwdec-software-fallback'], '300');
+    });
+
+    test('carries the +34 cache and cheap-GPU-render layers', () {
+      expect(kMpvAndroidOptions['demuxer-max-bytes'], '256MiB');
+      expect(kMpvAndroidOptions['scale'], 'bilinear');
+      expect(kMpvAndroidOptions['cscale'], 'bilinear');
+      expect(kMpvAndroidOptions['dscale'], 'bilinear');
+      expect(kMpvAndroidOptions['deband'], 'no');
+      expect(kMpvAndroidOptions['dither-depth'], 'no');
+      expect(kMpvAndroidOptions['correct-downscaling'], 'no');
+      // `tone-mapping: clip` is the cheapest HDR mapping — and it is
+      // NOT peak compute: `hdr-compute-peak` (the v20+1 black-screen
+      // value) stays out, and media_kit forces it off.
+      expect(kMpvAndroidOptions['tone-mapping'], 'clip');
     });
 
     test('never carries the v20+1 black-screen value', () {
       expect(kMpvAndroidOptions.containsKey('hdr-compute-peak'), isFalse);
-      expect(kMpvAndroidOptions.containsKey('tone-mapping'), isFalse);
-      expect(kMpvAndroidOptions.containsKey('target-colorspace-hint'),
-          isFalse);
+      expect(kMpvAndroidOptions.containsKey('target-colorspace-hint'), isFalse);
     });
 
     test('never touches the video output', () {

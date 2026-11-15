@@ -171,6 +171,10 @@ const int _kStallMaxReopens = 2;
 /// noise.
 const Duration _kThermalPoll = Duration(seconds: 30);
 
+/// The mpv stats overlay's refresh (+34): the live measurements are
+/// re-read this often while playing.
+const Duration _kMpvStatsInterval = Duration(seconds: 2);
+
 /// Pinch-zoom range, same as the VLC screen.
 const double _kMinZoom = 0.5;
 const double _kMaxZoom = 3.0;
@@ -354,6 +358,26 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// decides, per thermal tick, whether the phone's heat wants a quality
   /// change. Pure — the screen acts on its decision.
   final ThermalQualityGovernor _thermalGovernor = ThermalQualityGovernor();
+
+  /// The mpv stats overlay (+34): the live playback measurements
+  /// (decoder, render target, drop counters, cache) drawn over the
+  /// video while the QoE-log developer option is on. It rides on that
+  /// option because it is the only diagnostics switch that works on a
+  /// release build — the app-log viewer is debug-only, so a debugPrint
+  /// log is invisible on the user's phone and the overlay is the only
+  /// surface he can screenshot and report.
+  bool _showMpvStatsOverlay = false;
+
+  /// The overlay's text, refreshed every [_kMpvStatsInterval] while
+  /// playing. Empty until the first refresh.
+  final ValueNotifier<String> _mpvStatsText = ValueNotifier<String>('');
+
+  /// The drop counters at the last overlay refresh, so the overlay can
+  /// show the change since the last tick (+N) next to each cumulative
+  /// total.
+  final Map<String, int> _prevMpvDrops = <String, int>{};
+
+  Timer? _mpvStatsTimer;
 
   /// The stream that was playing when iOS PiP started, when the PiP
   /// quality drop (+31) moved to a lighter one. Null when no drop is
@@ -576,6 +600,8 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     _prebufferTimer?.cancel();
     _stallTimer?.cancel();
     _thermalTimer?.cancel();
+    _mpvStatsTimer?.cancel();
+    _mpvStatsText.dispose();
     _pipWatchdog?.cancel();
     _pipDiagTimer?.cancel();
     // The native side remembers the last synced playing state (see the
@@ -1144,6 +1170,10 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     // engine choice.
     _iosMpvPipEnabled =
         defaultTargetPlatform == TargetPlatform.iOS && settings.iosMpvPip;
+    // The stats overlay (+34): on while the QoE-log developer option is
+    // on — see [_showMpvStatsOverlay]. Read here, at setup, so the
+    // first play can arm its refresh timer.
+    _showMpvStatsOverlay = ref.read(settingsRepositoryProvider).getDevQoeLog();
     try {
       _videoController = VideoController(
         _player,
@@ -1285,6 +1315,22 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
             // engaged (see mpv_android_options.dart). Android should
             // print mediacodec; empty/no means software decode.
             unawaited(logMpvDecodeInfo(_player));
+            // The mpv stats baseline (+34): the measurements that tell
+            // the 4K layers apart — decoder, render target, drop
+            // counters, cache. And, while the governor is lightened,
+            // the render cap the fork re-requested full-size on this
+            // open's video-parameter change (see [_setIosRenderCap]):
+            // re-apply it now that the new stream's parameters are
+            // known (first frame is playing).
+            unawaited(_logMpvPlaybackStats('BASELINE'));
+            if (_thermalGovernor.isLightened) {
+              unawaited(_setIosRenderCap(true));
+            }
+            // The stats overlay (+34): the same values, live on screen
+            // while the QoE-log developer option is on — the only
+            // diagnostics surface that works on a release build (the
+            // app-log viewer is debug-only).
+            if (_showMpvStatsOverlay) _armMpvStatsTimer();
           }
         } else {
           _tracker?.onPaused();
@@ -1747,84 +1793,292 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       case ThermalQualityKind.none:
         break;
       case ThermalQualityKind.drop:
-        ref.read(notificationServiceProvider).showInfo(
-          'Phone is heating up — switched to '
-          '${_thermalTargetLabel(decision.targetIndex)} to stay smooth',
-          title: 'Phone is hot',
-        );
+        ref
+            .read(notificationServiceProvider)
+            .showInfo(
+              'Phone is heating up — switched to '
+              '${_thermalTargetLabel(decision.targetIndex)} to stay smooth',
+              title: 'Phone is hot',
+            );
         unawaited(_pickSource(decision.targetIndex));
       case ThermalQualityKind.restore:
-        ref.read(notificationServiceProvider).showInfo(
-          'Phone cooled down — back to '
-          '${_thermalTargetLabel(decision.targetIndex)}',
-          title: 'Phone cooled down',
-        );
+        ref
+            .read(notificationServiceProvider)
+            .showInfo(
+              'Phone cooled down — back to '
+              '${_thermalTargetLabel(decision.targetIndex)}',
+              title: 'Phone cooled down',
+            );
         unawaited(_pickSource(decision.targetIndex));
       case ThermalQualityKind.hint:
-        ref.read(notificationServiceProvider).showInfo(
-          'Phone is heating up — pick a lower quality in the Quality '
-          'tab to stay smooth',
-          title: 'Phone is hot',
-        );
+        ref
+            .read(notificationServiceProvider)
+            .showInfo(
+              'Phone is heating up — pick a lower quality in the Quality '
+              'tab to stay smooth',
+              title: 'Phone is hot',
+            );
       case ThermalQualityKind.lighten:
         // A single-file source: no ladder to drop to, so lighten the
         // render instead. The stream never changes, so playback
-        // carries on at the playhead.
-        unawaited(_applyThermalLighten());
-        ref.read(notificationServiceProvider).showInfo(
-          'Phone is heating up — playing at reduced detail to stay '
-          'smooth',
-          title: 'Phone is hot',
-        );
+        // carries on at the playhead. The toast only fires when the
+        // lightening actually applied (+34: +33 toasted success even
+        // when every property was refused).
+        if (await _applyThermalLighten()) {
+          ref
+              .read(notificationServiceProvider)
+              .showInfo(
+                'Phone is heating up — playing at reduced detail to stay '
+                'smooth',
+                title: 'Phone is hot',
+              );
+        }
       case ThermalQualityKind.unlighten:
-        unawaited(_clearThermalLighten());
-        ref.read(notificationServiceProvider).showInfo(
-          'Phone cooled down — back to full detail',
-          title: 'Phone cooled down',
+        if (await _clearThermalLighten()) {
+          ref
+              .read(notificationServiceProvider)
+              .showInfo(
+                'Phone cooled down — back to full detail',
+                title: 'Phone cooled down',
+              );
+        }
+    }
+  }
+
+  /// The iOS render cap (+34): caps the native render target at
+  /// 1920x1080 through the fork's `VideoController.setSize`, or restores
+  /// the native video-params size with a no-arg call. Returns whether
+  /// the cap actually applied. iOS only — the fork's Android controller
+  /// throws UnsupportedError for setSize, so this returns false there
+  /// without touching anything. A render cap is not a decode cap: the
+  /// phone still decodes the original 4K bitstream; the render target
+  /// is what shrinks, so the GPU has a quarter of the pixels to chew.
+  /// The fork re-requests the full size when the video parameters
+  /// change, so a source change while lightened re-applies the cap from
+  /// the first-play hook (see the `logMpvDecodeInfo` call site).
+  Future<bool> _setIosRenderCap(bool enabled) async {
+    if (defaultTargetPlatform != TargetPlatform.iOS) return false;
+    try {
+      if (enabled) {
+        await _videoController.setSize(width: 1920, height: 1080);
+      } else {
+        await _videoController.setSize();
+      }
+      if (kDebugMode) {
+        debugPrint(
+          '[4K] render cap=$enabled '
+          'texture=${_videoController.rect.value}',
         );
+      }
+      return true;
+    } catch (e) {
+      debugPrint('[4K] render cap failed: $e');
+      return false;
     }
   }
 
-  /// The +33 single-file thermal response: lighten the render of the
-  /// stream now playing (see [kThermalLightenProperties]) — a `vf`
-  /// scale to 1080p plus the fast-decode options. Applied at runtime
-  /// through the native player, so no re-open is needed; the same
-  /// `setProperty` path the screen already uses for `sub-visibility`
-  /// in PiP. Best effort: a property mpv refuses is ignored, and the
-  /// screen keeps playing.
-  Future<void> _applyThermalLighten() async {
-    final platform = _player.platform;
-    if (platform is! NativePlayer) return;
-    for (final entry in kThermalLightenProperties.entries) {
-      try {
-        await platform.setProperty(entry.key, entry.value);
-      } catch (_) {
-        // Best-effort: one refused property must not stop the others.
+  /// The single-file thermal response: lighten the render of the stream
+  /// now playing. The actuation is split by platform (+34): on iOS the
+  /// render target is capped at 1920x1080 ([_setIosRenderCap]); on
+  /// Android the `vf` scale + lavc options ([kThermalLightenProperties])
+  /// are set through the native player, the same `setProperty` path the
+  /// screen already uses for `sub-visibility` in PiP. No re-open is
+  /// needed either way. Returns whether the lightening actually applied
+  /// — +33 swallowed every exception and toasted success anyway, so a
+  /// refused property looked like a fix; now a failure is logged and
+  /// the toast stays silent (see [_onThermalTick]).
+  Future<bool> _applyThermalLighten() async {
+    await _logMpvPlaybackStats('BEFORE LIGHTEN');
+    final bool applied;
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      applied = await _setIosRenderCap(true);
+    } else {
+      applied = await _applyLightenProperties(kThermalLightenProperties);
+    }
+    if (applied) {
+      await _logMpvPlaybackStats('AFTER LIGHTEN');
+      if (kDebugMode) {
+        debugPrint('mpv thermal: render lightened for a single-file 4K stream');
       }
     }
-    if (kDebugMode) {
-      debugPrint(
-        'mpv thermal: lightening the render '
-        '($kThermalLightenVf) for a single-file 4K stream',
+    return applied;
+  }
+
+  /// Take the render lightening off again (the phone cooled, or the
+  /// stream itself is light now). Returns whether the restore actually
+  /// applied, same contract as [_applyThermalLighten].
+  Future<bool> _clearThermalLighten() async {
+    await _logMpvPlaybackStats('BEFORE UNLIGHTEN');
+    final bool cleared;
+    if (defaultTargetPlatform == TargetPlatform.iOS) {
+      cleared = await _setIosRenderCap(false);
+    } else {
+      cleared = await _applyLightenProperties(kThermalUnlightenProperties);
+    }
+    if (cleared) {
+      await _logMpvPlaybackStats('AFTER UNLIGHTEN');
+      if (kDebugMode) {
+        debugPrint('mpv thermal: render lightening cleared');
+      }
+    }
+    return cleared;
+  }
+
+  /// Applies one lighten/unlighten property map through the native
+  /// player. Best effort per property — one refused property must not
+  /// stop the others — but unlike +33 every failure is LOGGED, and the
+  /// return says whether ALL of them applied, so the caller can toast
+  /// only a real lightening.
+  Future<bool> _applyLightenProperties(Map<String, String> properties) async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return false;
+    var allApplied = true;
+    for (final entry in properties.entries) {
+      try {
+        await platform.setProperty(entry.key, entry.value);
+      } catch (e) {
+        allApplied = false;
+        debugPrint('[mpv] thermal property ${entry.key} not applied: $e');
+      }
+    }
+    return allApplied;
+  }
+
+  /// Reads the live mpv measurements, as `property → value`. Each read
+  /// is its own try/catch: an unreadable property is skipped, never
+  /// fatal. Shared by the debug log ([_logMpvPlaybackStats]) and the
+  /// on-screen overlay ([_refreshMpvStatsOverlay]).
+  Future<Map<String, String>> _readMpvStats() async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return <String, String>{};
+    const properties = <String>[
+      'hwdec',
+      'hwdec-current',
+      'video-params/w',
+      'video-params/h',
+      'video-params/gamma',
+      'video-out-params/w',
+      'video-out-params/h',
+      'vf',
+      'framedrop',
+      'video-sync',
+      'decoder-frame-drop-count',
+      'frame-drop-count',
+      'mistimed-frame-count',
+      'vo-delayed-frame-count',
+      'demuxer-cache-duration',
+      'cache-speed',
+      'paused-for-cache',
+      'estimated-vf-fps',
+    ];
+    final stats = <String, String>{};
+    for (final name in properties) {
+      try {
+        final value = await platform.getProperty(name);
+        stats[name] = value.toString();
+      } catch (_) {
+        // Unreadable on this build: skip it, never fatal.
+      }
+    }
+    return stats;
+  }
+
+  /// The mpv playback stats (+34): the measurements that tell the 4K
+  /// layers apart. `hwdec-current` is the decoder actually in use
+  /// (`no` means software decode); `video-params/h` is the source
+  /// height and `video-out-params/h` is the height after filters, so
+  /// the two together prove whether a downscale really applied (a bare
+  /// `vf` read-back does not — mpv 0.41 stopped rejecting bad filter
+  /// values); `video-params/gamma` is `pq` for HDR; the drop counters
+  /// are CUMULATIVE, so compare their change over a fixed interval
+  /// rather than the final number. Called at first play (the baseline)
+  /// and around every lighten/unlighten. The same values also feed the
+  /// on-screen overlay ([_refreshMpvStatsOverlay]), which is the
+  /// surface the user can read on a release build.
+  Future<void> _logMpvPlaybackStats(String label) async {
+    final stats = await _readMpvStats();
+    if (stats.isEmpty) return;
+    debugPrint('========== MPV $label ==========');
+    for (final entry in stats.entries) {
+      debugPrint('[MPV] ${entry.key} = ${entry.value}');
+    }
+    debugPrint('[MPV] texture rect = ${_videoController.rect.value}');
+    debugPrint('[MPV] iOS PiP renderer mode = $_iosMpvPipEnabled');
+    debugPrint('================================');
+  }
+
+  /// Arms the stats overlay's refresh: every [_kMpvStatsInterval] the
+  /// live mpv measurements are re-read into [_mpvStatsText]. Armed
+  /// once, at first play, and only while the overlay option is on.
+  /// Cancelled in dispose.
+  void _armMpvStatsTimer() {
+    if (_mpvStatsTimer != null) return;
+    _mpvStatsTimer = Timer.periodic(_kMpvStatsInterval, (_) {
+      if (_disposed || !_playing) return;
+      unawaited(_refreshMpvStatsOverlay());
+    });
+  }
+
+  /// Re-reads the live mpv measurements into the overlay's text. The
+  /// drop counters are cumulative, so each shows its total and the
+  /// change since the last refresh (+N) — the change over the 2 s
+  /// interval is what says whether frames are being dropped right now.
+  /// The overlay is the phone test's primary diagnostic (+34): PiP was
+  /// OFF during the failed +33 test and 4K still lagged, so the
+  /// renderer theory is out and these numbers decide between decoder
+  /// drops, presentation drops, and cache underruns.
+  Future<void> _refreshMpvStatsOverlay() async {
+    final stats = await _readMpvStats();
+    if (_disposed || stats.isEmpty) return;
+    String dropLine(String key, String label) {
+      final total = int.tryParse(stats[key] ?? '') ?? 0;
+      final prev = _prevMpvDrops[key];
+      _prevMpvDrops[key] = total;
+      final delta = prev == null ? 0 : total - prev;
+      return '$label: $total (+$delta)';
+    }
+
+    final rect = _videoController.rect.value;
+    final tex = rect == null
+        ? '?'
+        : '${rect.width.toInt()}x${rect.height.toInt()}';
+    final buffer = StringBuffer()
+      ..writeln('hwdec: ${stats['hwdec-current'] ?? '?'}')
+      ..writeln(
+        'src: ${stats['video-params/w'] ?? '?'}x${stats['video-params/h'] ?? '?'} '
+        'gamma:${stats['video-params/gamma'] ?? '?'}',
+      )
+      ..writeln(
+        'out: ${stats['video-out-params/w'] ?? '?'}x${stats['video-out-params/h'] ?? '?'} '
+        'tex: $tex',
+      )
+      ..writeln(dropLine('decoder-frame-drop-count', 'dec-drop'))
+      ..writeln(dropLine('frame-drop-count', 'vo-drop'))
+      ..writeln(dropLine('vo-delayed-frame-count', 'vo-delay'))
+      ..writeln(
+        'cache: ${stats['demuxer-cache-duration'] ?? '?'}s '
+        '${_formatBytesPerSec(stats['cache-speed'])}',
+      )
+      ..writeln('paused-cache: ${stats['paused-for-cache'] ?? '?'}')
+      ..writeln('vf-fps: ${stats['estimated-vf-fps'] ?? '?'}')
+      ..writeln(
+        'framedrop: ${stats['framedrop'] ?? '?'} '
+        'pip: ${_iosMpvPipEnabled ? 'on' : 'off'}',
       );
-    }
+    final text = buffer.toString().trimRight();
+    if (_mpvStatsText.value != text) _mpvStatsText.value = text;
   }
 
-  /// Take the +33 render lightening off again (the phone cooled, or
-  /// the stream itself is light now).
-  Future<void> _clearThermalLighten() async {
-    final platform = _player.platform;
-    if (platform is! NativePlayer) return;
-    for (final entry in kThermalUnlightenProperties.entries) {
-      try {
-        await platform.setProperty(entry.key, entry.value);
-      } catch (_) {
-        // Best-effort: one refused property must not stop the others.
-      }
+  /// A bytes-per-second figure in human units (`cache-speed` arrives
+  /// as raw bytes).
+  String _formatBytesPerSec(String? raw) {
+    final value = double.tryParse(raw ?? '');
+    if (value == null) return '?';
+    if (value >= 1048576) {
+      return '${(value / 1048576).toStringAsFixed(1)} MiB/s';
     }
-    if (kDebugMode) {
-      debugPrint('mpv thermal: render lightening cleared');
-    }
+    if (value >= 1024) return '${(value / 1024).toStringAsFixed(0)} KiB/s';
+    return '${value.toStringAsFixed(0)} B/s';
   }
 
   /// The label a thermal switch's toast names ("1080p", "720p"): the
@@ -2683,6 +2937,48 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
                     }
                   : null,
               isTv: isTv,
+            ),
+
+          // The mpv stats overlay (+34): the live measurements over the
+          // video while the QoE-log developer option is on — the only
+          // diagnostics surface that works on a release build (the
+          // app-log viewer is debug-only). Never interactive
+          // (IgnorePointer), so it cannot steal a tap, a swipe or a
+          // pinch from the gesture layer below it. Top-left, below the
+          // top bar, so it sits over the picture rather than the
+          // chrome; a tap hides the chrome and leaves it fully
+          // readable.
+          if (_showMpvStatsOverlay)
+            Positioned(
+              top: 64,
+              left: 8,
+              child: IgnorePointer(
+                child: ValueListenableBuilder<String>(
+                  valueListenable: _mpvStatsText,
+                  builder: (context, text, _) {
+                    if (text.isEmpty) return const SizedBox.shrink();
+                    return Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withValues(alpha: 0.6),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        text,
+                        style: const TextStyle(
+                          color: Colors.greenAccent,
+                          fontSize: 10,
+                          height: 1.4,
+                          fontFamily: 'monospace',
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
             ),
         ],
       ),

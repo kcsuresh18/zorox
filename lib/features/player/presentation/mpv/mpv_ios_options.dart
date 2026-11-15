@@ -12,18 +12,39 @@
 /// that spiral: a lost session is recreated and hardware decode resumes,
 /// instead of the file playing in software until it ends.
 ///
-/// `framedrop: decoder+vo` is the same drop policy Android already has
-/// (+16): when a frame cannot be decoded in time it is dropped instead
-/// of stalling the clock, so a hot phone stutters briefly rather than
-/// falling behind and never catching up.
+/// `framedrop: vo` is mpv's recommended mode (+34, was `decoder+vo`):
+/// when a frame cannot be presented in time it is dropped instead of
+/// stalling the clock, so a hot phone stutters briefly rather than
+/// falling behind and never catching up. mpv's manual calls `vo` "the
+/// recommended mode, and the default" and says `decoder+vo` is "Not
+/// recommended" — the decoder side also skips frames, which costs
+/// decode work for nothing when the bottleneck is the render.
 ///
-/// Deliberately NOT here: `video-sync` (heat-irrelevant), any
-/// tone-mapping or `hdr-compute-peak` (blacks the video with
-/// `vo=libmpv`, proven in v20+1 — media_kit forces peak compute off),
-/// and Nuvio's `vo=gpu-next` + MoltenVK native path (a redesign: ZoroX
-/// renders through media_kit's Flutter texture, and Nuvio has no
-/// thermal-state handling at all — it doesn't need it, because its
-/// rendering path is efficient and the fallback prevents the spiral).
+/// `demuxer-max-bytes: 256MiB` (+34): the network cache's byte cap
+/// (default 150 MiB). The 20.96 GB file is only ~15 Mbps, but a bigger
+/// headroom rides out throughput dips without a cache stall. Costs only
+/// RAM. `demuxer-readahead-secs` is NOT set: under the cache it is
+/// mostly ignored (`cache-secs` overrides it), so it would be a no-op.
+///
+/// The scaler options (+34, the cheap GPU render layer): `scale` /
+/// `cscale` / `dscale: bilinear` is the fastest scaler (the defaults
+/// are lanczos / hermite), `deband: no` and `dither-depth: no` skip
+/// two GPU passes, `correct-downscaling: no` skips the extra downscale
+/// pass, and `tone-mapping: clip` is the cheapest HDR mapping. These
+/// are gl_video options, so they apply only in the OpenGL render path
+/// (normal playback, PiP OFF) — in the software render path (PiP ON)
+/// they are no-ops, and the equivalent cheap knob there would be
+/// `sws-scaler` / `sws-fast`. The cost is a little picture quality:
+/// bilinear is visibly softer than lanczos on a 4K downscale, and
+/// hard-clipped highlights lose rolloff.
+///
+/// Deliberately NOT here: `video-sync` (heat-irrelevant),
+/// `hdr-compute-peak` (blacks the video with `vo=libmpv`, proven in
+/// v20+1 — media_kit forces peak compute off), and Nuvio's `vo=gpu-next`
+/// + MoltenVK native path (a redesign: ZoroX renders through media_kit's
+/// Flutter texture). `tone-mapping` itself is NOT peak compute: it only
+/// picks the mapping curve, and `clip` is the cheapest one; peak compute
+/// stays off.
 library;
 
 import 'package:flutter/foundation.dart';
@@ -32,7 +53,15 @@ import 'package:media_kit/media_kit.dart';
 /// The iOS-only mpv options, as `option → value`.
 const Map<String, String> kMpvIosOptions = <String, String>{
   'hwdec-software-fallback': '300',
-  'framedrop': 'decoder+vo',
+  'framedrop': 'vo',
+  'demuxer-max-bytes': '256MiB',
+  'scale': 'bilinear',
+  'cscale': 'bilinear',
+  'dscale': 'bilinear',
+  'deband': 'no',
+  'dither-depth': 'no',
+  'correct-downscaling': 'no',
+  'tone-mapping': 'clip',
 };
 
 /// The `hwdec` value for the iOS VideoController.

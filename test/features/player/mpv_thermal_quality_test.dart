@@ -81,12 +81,27 @@ void main() {
     });
 
     test('drops frames instead of falling behind, like Android', () {
-      expect(kMpvIosOptions['framedrop'], 'decoder+vo');
+      // +34: mpv's manual calls `vo` "the recommended mode, and the
+      // default" and says `decoder+vo` is "Not recommended".
+      expect(kMpvIosOptions['framedrop'], 'vo');
+    });
+
+    test('carries the +34 cache and cheap-GPU-render layers', () {
+      expect(kMpvIosOptions['demuxer-max-bytes'], '256MiB');
+      expect(kMpvIosOptions['scale'], 'bilinear');
+      expect(kMpvIosOptions['cscale'], 'bilinear');
+      expect(kMpvIosOptions['dscale'], 'bilinear');
+      expect(kMpvIosOptions['deband'], 'no');
+      expect(kMpvIosOptions['dither-depth'], 'no');
+      expect(kMpvIosOptions['correct-downscaling'], 'no');
+      // `tone-mapping: clip` is the cheapest HDR mapping — and it is
+      // NOT peak compute: `hdr-compute-peak` (the v20+1 black-screen
+      // value) stays out, and media_kit forces it off.
+      expect(kMpvIosOptions['tone-mapping'], 'clip');
     });
 
     test('never carries the options that blank the video', () {
       expect(kMpvIosOptions.containsKey('hdr-compute-peak'), isFalse);
-      expect(kMpvIosOptions.containsKey('tone-mapping'), isFalse);
       expect(kMpvIosOptions.containsKey('video-sync'), isFalse);
       expect(kMpvIosOptions.containsKey('vo'), isFalse);
     });
@@ -504,18 +519,21 @@ void main() {
     });
   });
 
-  group('ThermalQualityGovernor — the single-file lighten (+33)', () {
+  group('ThermalQualityGovernor — the single-file lighten (+33, +34)', () {
     test('the lighten properties scale the render to 1080p and the '
         'unlighten clears them', () {
+      // +34: these properties are the ANDROID lighten actuation only.
+      // On iOS the screen caps the render target through
+      // `VideoController.setSize` instead — a `vf=scale` under
+      // zero-copy videotoolbox forces a GPU→CPU download, a CPU scale
+      // and a re-upload, and `vd-lavc-fast` is H.264/MPEG-1/2 only
+      // (a no-op on the HEVC file).
       expect(kThermalLightenVf, 'scale=-2:1080');
       expect(kThermalLightenProperties['vf'], kThermalLightenVf);
       expect(kThermalLightenProperties['vd-lavc-skiploopfilter'], 'all');
       expect(kThermalLightenProperties['vd-lavc-fast'], 'yes');
       expect(kThermalUnlightenProperties['vf'], '');
-      expect(
-        kThermalUnlightenProperties['vd-lavc-skiploopfilter'],
-        'default',
-      );
+      expect(kThermalUnlightenProperties['vd-lavc-skiploopfilter'], 'default');
       expect(kThermalUnlightenProperties['vd-lavc-fast'], 'no');
     });
 

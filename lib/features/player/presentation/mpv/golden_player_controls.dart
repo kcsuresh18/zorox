@@ -39,6 +39,7 @@ library;
 import 'dart:async';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:vlc_player/vlc_player.dart';
@@ -116,6 +117,18 @@ double clampVideoScale(double scale) =>
 /// unit-tested.
 double videoScaleAfterPinch(double startScale, double gestureScale) =>
     clampVideoScale(startScale * gestureScale);
+
+/// The zoom a raw two-finger pinch lands on (+34): [startScale] is the
+/// zoom when the pinch started, [startSpan] is the fingers' distance
+/// then, and [currentSpan] is their distance now. The span ratio is the
+/// gesture scale, so spreading apart zooms in and pinching in zooms out,
+/// held to the pinch range. A start span under 1 px (two fingers on the
+/// same point) is treated as 1 px, so the ratio can never explode. Pure,
+/// so it is unit-tested.
+double rawPinchScale(double startScale, double startSpan, double currentSpan) {
+  final double span = startSpan < 1.0 ? 1.0 : startSpan;
+  return videoScaleAfterPinch(startScale, currentSpan / span);
+}
 
 class GoldenPlayerControls extends ConsumerStatefulWidget {
   const GoldenPlayerControls({
@@ -249,6 +262,33 @@ class _GoldenPlayerControlsState
   /// Pinch state, for the zoom.
   bool _pinching = false;
   double _pinchStartScale = 1.0;
+
+  /// The raw two-finger pinch (+34): the pointers the Listener is
+  /// tracking, bypassing the gesture arena entirely. A Listener receives
+  /// every pointer event unconditionally, so a pinch cannot lose the
+  /// arena to the long-press deadline (500 ms) or to the first finger
+  /// winning alone as a pan — the two ways the +33 arena pinch died on
+  /// the phone (the user's video showed the subtitle rail while he was
+  /// pinching: his spread was read as a centre-third vertical swipe).
+  /// The scale recognizer stays for the single-finger pan only; while a
+  /// raw pinch is in flight it is suppressed (see [_suppressScale]).
+  final Map<int, Offset> _touches = <int, Offset>{};
+
+  /// True while two fingers are down and the raw pinch owns the zoom.
+  bool _rawPinching = false;
+
+  /// While true, the scale recognizer's handlers do nothing — the raw
+  /// pinch owns the gesture, so the arena's pan must not also run.
+  bool _suppressScale = false;
+
+  /// True once a two-finger pinch has started in this touch sequence, so
+  /// the tap and double-tap recognizers do not fire when the pinch ends
+  /// (a pinch's lift is not a tap, and not a seek).
+  bool _pinchConsumed = false;
+
+  /// The fingers' distance and the zoom when the raw pinch started.
+  double _rawPinchStartSpan = 1.0;
+  double _rawPinchStartScale = 1.0;
 
   // -- vertical swipe rails (volume right / brightness left / subtitles
   // centre) + the horizontal subtitle swipe -------------------------------
@@ -407,31 +447,133 @@ class _GoldenPlayerControlsState
 
   // -- pinch zoom + vertical swipe rails -----------------------------------
 
-  /// Lands the pan's anchor: a [Listener] reports the pointer's down
-  /// immediately, before any arena resolution. The tap recognizer's
-  /// `onTapDown` cannot do this — it only fires once the tap has won the
-  /// arena, and a pan's tap never does. The anchor is only taken while no
-  /// pan or pinch is in flight, so a second finger landing mid-gesture
-  /// cannot move it.
+  /// Lands the pan's anchor and tracks the raw two-finger pinch (+34):
+  /// a [Listener] reports the pointer's down immediately, before any
+  /// arena resolution. The tap recognizer's `onTapDown` cannot do this —
+  /// it only fires once the tap has won the arena, and a pan's tap never
+  /// does. The anchor is only taken on a fresh touch sequence, so a
+  /// second finger landing mid-gesture cannot move it.
+  ///
+  /// The pinch lives here, not in the scale recognizer: when the second
+  /// finger lands, the raw pinch takes over the zoom ([_rawPinching]),
+  /// the scale recognizer is suppressed ([_suppressScale]) so its pan
+  /// cannot also run, and any 2x hold or rail in flight ends. The zoom
+  /// is the fingers' distance ratio from the pinch's start
+  /// ([rawPinchScale]), so it cannot be stolen by the long-press
+  /// deadline or by the first finger winning alone as a pan.
   void _onPointerDown(PointerDownEvent event) {
-    if (_panAxis != _GoldenPanAxis.none || _pinching) return;
-    _panAnchor = event.position;
-    _panAnchorLocalX = event.localPosition.dx;
+    if (event.kind != PointerDeviceKind.touch) return;
+    // A fresh touch sequence.
+    if (_touches.isEmpty) {
+      _pinchConsumed = false;
+      _panAnchor = event.position;
+      _panAnchorLocalX = event.localPosition.dx;
+    }
+    _touches[event.pointer] = event.position;
+    if (_touches.length == 2) {
+      _suppressScale = true;
+      _pinchConsumed = true;
+      _pinching = false;
+      _panAxis = _GoldenPanAxis.none;
+      _railDragEnd();
+      _endSpeedBoost();
+      _rawPinching = true;
+      _rawPinchStartScale = widget.videoScale?.value ?? 1.0;
+      final points = _touches.values.toList();
+      _rawPinchStartSpan = (points[0] - points[1]).distance;
+      if (_rawPinchStartSpan < 1.0) {
+        _rawPinchStartSpan = 1.0;
+      }
+      if (kDebugMode) {
+        debugPrint(
+          '[ZOOM] start scale=$_rawPinchStartScale '
+          'span=$_rawPinchStartSpan',
+        );
+      }
+    }
   }
 
-  /// The one scale gesture: pan with one finger, pinch with two.
+  /// The raw pinch's move (+34): the fingers' distance against the
+  /// pinch's start span is the zoom. Only while two fingers are down;
+  /// a pinch that wound down to one finger stays suppressed until every
+  /// finger lifts, so the remainder can never become a brightness,
+  /// volume or subtitle swipe.
+  void _onPointerMove(PointerMoveEvent event) {
+    if (!_touches.containsKey(event.pointer)) return;
+    _touches[event.pointer] = event.position;
+    if (!_rawPinching || _touches.length != 2) return;
+    final notifier = widget.videoScale;
+    if (notifier == null) return;
+    final points = _touches.values.toList();
+    final span = (points[0] - points[1]).distance;
+    final nextScale = rawPinchScale(
+      _rawPinchStartScale,
+      _rawPinchStartSpan,
+      span,
+    );
+    if (nextScale != notifier.value) {
+      notifier.value = nextScale;
+      if (kDebugMode) {
+        debugPrint(
+          '[ZOOM] two fingers '
+          'scale=${nextScale.toStringAsFixed(2)}',
+        );
+      }
+    }
+  }
+
+  /// One finger of a touch sequence left: forget it. When fewer than two
+  /// fingers remain the raw pinch is over, and when none remain the
+  /// suppression lifts and the pan anchor goes with the gesture, so the
+  /// remainder of a pinch can never turn into a swipe.
+  void _finishPointer(int pointer) {
+    _touches.remove(pointer);
+    if (_touches.length < 2) {
+      _rawPinching = false;
+    }
+    if (_touches.isEmpty) {
+      _suppressScale = false;
+      _panAxis = _GoldenPanAxis.none;
+      _panAnchor = null;
+      _panAnchorLocalX = null;
+    }
+  }
+
+  void _onPointerUp(PointerUpEvent event) {
+    _finishPointer(event.pointer);
+  }
+
+  void _onPointerCancel(PointerCancelEvent event) {
+    _finishPointer(event.pointer);
+  }
+
+  /// Clears the raw-pinch state: a lock toggle swaps the gesture layer
+  /// while fingers are down, so the Listener stops hearing pointer-ups
+  /// and stale pointers would otherwise suppress the scale recognizer
+  /// after unlock.
+  void _clearRawPinchState() {
+    _touches.clear();
+    _rawPinching = false;
+    _suppressScale = false;
+  }
+
+  /// The single-finger pan (+34: the pinch moved to the Listener — see
+  /// [_onPointerDown] — because the arena lost it to the long-press
+  /// deadline and to the first finger winning alone; the scale
+  /// recognizer now owns the pan only, and stays suppressed while a raw
+  /// pinch is in flight).
   ///
   /// Why one recognizer, and not a separate drag pair: the scale
   /// recognizer used to live under the video, below this detector's drag
   /// recognizers, and the two raced in the gesture arena for the same
   /// first finger. One recognizer cannot race itself: while it tracks one
-  /// finger its focal movement is the pan, and the moment a second finger
-  /// lands its span is the pinch. The tap, the double-tap seek and the
-  /// long-press boost stay on separate recognizers in the same detector —
-  /// a tap moves nowhere and a hold moves nowhere, so neither can steal a
-  /// pinch that moves, and a swipe that moves wins the arena before the
-  /// long-press timer fires.
+  /// finger its focal movement is the pan. The tap, the double-tap seek
+  /// and the long-press boost stay on separate recognizers in the same
+  /// detector — a tap moves nowhere and a hold moves nowhere, so neither
+  /// can steal a pan that moves, and a swipe that moves wins the arena
+  /// before the long-press timer fires.
   void _onScaleStart(ScaleStartDetails d) {
+    if (_suppressScale) return;
     // A stale pan from an end the framework never delivered — an
     // interrupted pointer — is cleared here, so the next gesture does not
     // inherit a rail.
@@ -458,6 +600,13 @@ class _GoldenPlayerControlsState
   }
 
   void _onScaleUpdate(ScaleUpdateDetails d) {
+    if (kDebugMode) {
+      debugPrint(
+        '[ARENA] count=${d.pointerCount} '
+        'scale=${d.scale.toStringAsFixed(3)}',
+      );
+    }
+    if (_suppressScale) return;
     if (d.pointerCount >= 2) {
       // A second finger landed mid-pan: the pan is cancelled, not
       // committed. A rail already applies live, so ending it is only
@@ -515,6 +664,7 @@ class _GoldenPlayerControlsState
   }
 
   void _onScaleEnd(ScaleEndDetails d) {
+    if (_suppressScale) return;
     if (d.pointerCount >= 2) {
       // More than one pointer is still down: the pan just ended because a
       // second finger landed, and the gesture carries on as a pinch.
@@ -851,18 +1001,37 @@ class _GoldenPlayerControlsState
           // The Listener lands the pan's anchor (see [_onPointerDown]):
           // it reports the pointer's down immediately, before any arena
           // resolution, which no recognizer on this detector can do.
+          // +34: it also tracks the two-finger pinch itself, because
+          // the scale recognizer lost the arena to the long-press
+          // deadline and to the first finger winning alone as a pan.
           Listener(
+            behavior: HitTestBehavior.translucent,
             onPointerDown: _onPointerDown,
+            onPointerMove: _onPointerMove,
+            onPointerUp: _onPointerUp,
+            onPointerCancel: _onPointerCancel,
             child: GestureDetector(
               behavior: HitTestBehavior.translucent,
-              onTap: widget.chrome.toggle,
+              onTap: () {
+                if (!_pinchConsumed) {
+                  widget.chrome.toggle();
+                }
+              },
               onDoubleTapDown: doubleTapEnabled
-                  ? (d) => _doubleTap(d.localPosition.dx)
+                  ? (d) {
+                      if (!_pinchConsumed) {
+                        _doubleTap(d.localPosition.dx);
+                      }
+                    }
                   : null,
               onScaleStart: _onScaleStart,
               onScaleUpdate: _onScaleUpdate,
               onScaleEnd: _onScaleEnd,
-              onLongPressStart: (d) => _startSpeedBoost(d.localPosition.dx),
+              onLongPressStart: (d) {
+                if (!_pinchConsumed && !_suppressScale) {
+                  _startSpeedBoost(d.localPosition.dx);
+                }
+              },
               onLongPressEnd: (_) => _endSpeedBoost(),
               onLongPressCancel: _endSpeedBoost,
             ),
@@ -1045,12 +1214,19 @@ class _GoldenPlayerControlsState
                                   // the speed the hold will restore (1x) —
                                   // never "2x": the viewer asked for no
                                   // "2x" written anywhere during a hold.
-                                  speed: _speedBeforeBoost ??
-                                      value.playbackSpeed,
+                                  speed:
+                                      _speedBeforeBoost ?? value.playbackSpeed,
                                   onPickSpeed: _pickSpeed,
                                   locked: _locked,
                                   lockAvailable: widget.lockAvailable,
                                   onToggleLock: () {
+                                    // A lock toggle mid-touch swaps the
+                                    // gesture layer, so the Listener
+                                    // stops hearing pointer-ups: clear
+                                    // the raw-pinch state or a stale
+                                    // pinch would suppress the scale
+                                    // recognizer after unlock (+34).
+                                    _clearRawPinchState();
                                     widget.locked?.value = !(_locked);
                                     widget.chrome.poke();
                                   },
