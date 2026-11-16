@@ -517,6 +517,28 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     }
   }
 
+  // +53: the enter poll budget. The layer MUST hold a frame before
+  // startPictureInPicture — an empty layer reports
+  // isPictureInPicturePossible == false and the start refuses (the
+  // +29 regression). The layer processes the enqueued buffer
+  // asynchronously, so possible may flip true a beat after the
+  // enqueue — and on a COLD layer (first-ever prime, fresh app
+  // launch) that beat is longer than the old 20-tick (~1 s) poll:
+  // the user confirmed (2026-11-16) the first Home swipe NEVER
+  // opens PiP while the 2nd/3rd swipe does, i.e. the cold layer
+  // needs >1 s and is warm by the 2nd/3rd attempt. 60 ticks at
+  // 50 ms is ~3 s — 3x the old budget, enough for the cold layer
+  // to warm up in one attempt (it warmed within ~2–3 s of
+  // cumulative processing across swipes), and still inside the
+  // Dart side's 5 s watchdog. A failed entry leaves the renderer
+  // stale in the background (no PiP keeping it alive, and the +49
+  // resume re-open is gated off while PiP is enabled), so the
+  // return comes back with a blown-out white, frozen-ish picture
+  // and dead touch until another Home → return cycle warms the
+  // layer — the +53 white-video symptom. Opening PiP on the first
+  // Home keeps the decoder/render alive and prevents that state.
+  private static let enterPollAttempts = 60
+
   private func enter(_ result: @escaping FlutterResult) {
     guard let pip = pip else {
       result(
@@ -558,18 +580,35 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     // held frame, then poll for possible: the layer processes the
     // enqueued buffer asynchronously, so possible may flip true a
     // beat after the enqueue. The Dart side has a 5 s watchdog, so a
-    // ~1 s wait here is safe.
-    attemptEnter(pip: pip, result: result, attemptsLeft: 20)
+    // ~3 s wait here is safe (see [enterPollAttempts], +53).
+    attemptEnter(pip: pip, result: result, attemptsLeft: Self.enterPollAttempts)
   }
 
   /// One tick of the enter() poll. Prime the layer if a newer held
   /// frame arrived since the last prime, then start when possible.
   /// Runs on the main queue (MethodChannel handlers are main-thread).
+  /// `isAuto` is true only for the Home-swipe path (see
+  /// [autoEnterPiP]): if the user came back to the foreground while
+  /// the longer +53 poll was still running, the start must NOT fire
+  /// — a PiP window popping up inside the app is not what auto-PiP
+  /// is for. The button path (isAuto false) is explicitly
+  /// user-initiated in the foreground, so it is unaffected.
   private func attemptEnter(
     pip: AVPictureInPictureController,
     result: @escaping FlutterResult,
-    attemptsLeft: Int
+    attemptsLeft: Int,
+    isAuto: Bool = false
   ) {
+    // +53: auto-PiP only while backgrounded. The longer poll gives a
+    // returning user time to come back mid-poll; starting PiP then
+    // would open the window on top of the app they just returned to.
+    if isAuto,
+      UIApplication.shared.applicationState == .active
+    {
+      layer?.flushAndRemoveImage()
+      finishEnter(result: result, success: false)
+      return
+    }
     // Keep the layer's image fresh while we wait: a newer prime
     // replaces the stale one.
     if let prime = takePrimeIfNewer() {
@@ -604,7 +643,8 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
         self.attemptEnter(
           pip: pip,
           result: result,
-          attemptsLeft: attemptsLeft - 1
+          attemptsLeft: attemptsLeft - 1,
+          isAuto: isAuto
         )
       }
       return
@@ -705,7 +745,12 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     lock.unlock()
     guard !already else { return }
     primeForBackground()
-    attemptEnter(pip: pip, result: { _ in }, attemptsLeft: 20)
+    attemptEnter(
+      pip: pip,
+      result: { _ in },
+      attemptsLeft: Self.enterPollAttempts,
+      isAuto: true
+    )
   }
 
   /// Back active without PiP up: a background prime that never became
