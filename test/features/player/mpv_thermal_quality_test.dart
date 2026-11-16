@@ -89,7 +89,7 @@ void main() {
     });
 
     test('carries the +34 cache and cheap-GPU-render layers', () {
-      expect(kMpvIosOptions['demuxer-max-bytes'], '512MiB');
+      expect(kMpvIosOptions['demuxer-max-bytes'], '768MiB');
       expect(kMpvIosOptions['scale'], 'bilinear');
       expect(kMpvIosOptions['cscale'], 'bilinear');
       expect(kMpvIosOptions['dscale'], 'bilinear');
@@ -102,15 +102,19 @@ void main() {
       expect(kMpvIosOptions['tone-mapping'], 'clip');
     });
 
-    test('pre-buffers 60 s ahead so a slow line does not stall (+54)', () {
+    test('pre-buffers without a time cap so a slow line does not stall '
+        '(+54, +55)', () {
       // mpv's default cache-secs is 10: only ~10 s ahead of the
       // playhead, so a dip drains it in seconds and the player stalls
       // (user report 2026-11-16: "buffer bohot jaldi karey agey ka").
-      // 60 s is 6x the read-ahead. The 512 MiB byte cap (above) is
-      // what lets the 60 s window survive on high-bitrate 4K: 60 s at
-      // ~50 Mbit/s is ~375 MB, and the old 256 MiB would have capped
-      // it at ~41 s.
-      expect(kMpvIosOptions['cache-secs'], '60');
+      // +54 raised it to 60 s; +55 removes the time cap altogether at
+      // the user's ask ("60 sec nahi jitna sync karsakega jitne time
+      // tak hota rehe"): 3600 s means time never limits the buffer —
+      // mpv reads ahead until the byte cap stops it. The 768 MiB byte
+      // cap (above) is the real limit and the jetsam safety valve: it
+      // holds ~2 min at 50 Mbit/s peak 4K, ~4 min at 25 Mbit/s, and
+      // ~10-13 min at 1080p.
+      expect(kMpvIosOptions['cache-secs'], '3600');
     });
 
     test('reconnects a socket iOS killed while suspended (+49)', () {
@@ -583,8 +587,7 @@ void main() {
       expect(governor.isLightened, isTrue);
     });
 
-    test('the lightening comes off after two consecutive nominal ticks',
-        () {
+    test('the lightening comes off after two consecutive nominal ticks', () {
       final governor = ThermalQualityGovernor();
       governor.evaluate(
         thermal: ThermalState.serious,
@@ -655,8 +658,7 @@ void main() {
       );
     });
 
-    test('switching to a light stream takes the lightening off at once',
-        () {
+    test('switching to a light stream takes the lightening off at once', () {
       final governor = ThermalQualityGovernor();
       governor.evaluate(
         thermal: ThermalState.serious,
@@ -703,8 +705,7 @@ void main() {
       );
     });
 
-    test('a manual 4K pick is never lightened while the episode lasts',
-        () {
+    test('a manual 4K pick is never lightened while the episode lasts', () {
       final governor = ThermalQualityGovernor();
       governor.noteManualPick(0);
       expect(
@@ -817,8 +818,7 @@ void main() {
       );
     });
 
-    test('in PiP a drop episode survives untouched and resumes after',
-        () {
+    test('in PiP a drop episode survives untouched and resumes after', () {
       final governor = ThermalQualityGovernor();
       const qualities = <int?>[2160, 1080, 720];
       // Hot out of PiP: drops 4K → 1080p.

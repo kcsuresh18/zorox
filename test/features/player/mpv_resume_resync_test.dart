@@ -1,19 +1,19 @@
-/// Resume re-open decision (+48, +49, +50): on return from Home (PiP OFF)
-/// the VideoToolbox decoder's reference frames are stale from the
-/// background suspension, so the player restarts mid-GOP — macroblocked
-/// for a few seconds, sometimes frozen — until the next keyframe. +48
-/// fixed that with a seek to the playhead, but the video stayed laggy
-/// and choppy (the HTTP socket is killed too, and the seek throws away
-/// the buffered cushion), so +49 re-opens the stream at the playhead
-/// instead — same gates, fresh connection + fresh decoder + pre-buffer
-/// while still paused. The re-open is only wanted when the player was
+/// Stall-fallback re-open decision (+48, +49, +50, +55): +55 removed the
+/// +49 re-open as the default return path (it showed 00:00/LIVE + black
+/// + spinner for ~3-4 s on every return) — return is a plain pause/resume
+/// now, and the re-open survives only as the fallback when the plain
+/// resume is verifiably dead (no position progress 8 s after
+/// resume-play). The fallback is only wanted when the player was
 /// actually background-paused: PiP keeps decoding, an open landing
 /// re-syncs on its own, and a film that never started has no position
 /// to re-open at. +50: only after a REAL backgrounding
 /// (`paused`/`hidden` → `resumed`) — a transient `inactive` (Control
 /// Center, Notification Center, a call) returns to `resumed` without
 /// ever backgrounding, and re-opening for one restarts the film for
-/// nothing (user proof 2026-11-16, The Odyssey).
+/// nothing (user proof 2026-11-16, The Odyssey). +55: the old
+/// `pipEnabled` gate is gone — with automatic PiP removed, the setting
+/// no longer implies a live window; only an actually-open window
+/// (`inPip`) skips the fallback.
 library;
 
 import 'package:flutter_test/flutter_test.dart';
@@ -25,7 +25,6 @@ void main() {
       expect(
         shouldResyncDecoderOnResume(
           wasBackgrounded: true,
-          pipEnabled: false,
           inPip: false,
           awaitingPrebuffer: false,
           startedPlaying: true,
@@ -35,17 +34,17 @@ void main() {
       );
     });
 
-    test('PiP enabled => no re-sync (the player never paused)', () {
+    test('PiP setting ON but no window => re-sync (auto-PiP removed in +55: '
+        'the setting no longer implies a live window)', () {
       expect(
         shouldResyncDecoderOnResume(
           wasBackgrounded: true,
-          pipEnabled: true,
           inPip: false,
           awaitingPrebuffer: false,
           startedPlaying: true,
           hasStream: true,
         ),
-        isFalse,
+        isTrue,
       );
     });
 
@@ -53,7 +52,6 @@ void main() {
       expect(
         shouldResyncDecoderOnResume(
           wasBackgrounded: true,
-          pipEnabled: false,
           inPip: true,
           awaitingPrebuffer: false,
           startedPlaying: true,
@@ -67,7 +65,6 @@ void main() {
       expect(
         shouldResyncDecoderOnResume(
           wasBackgrounded: true,
-          pipEnabled: false,
           inPip: false,
           awaitingPrebuffer: true,
           startedPlaying: true,
@@ -81,7 +78,6 @@ void main() {
       expect(
         shouldResyncDecoderOnResume(
           wasBackgrounded: true,
-          pipEnabled: false,
           inPip: false,
           awaitingPrebuffer: false,
           startedPlaying: false,
@@ -95,7 +91,6 @@ void main() {
       expect(
         shouldResyncDecoderOnResume(
           wasBackgrounded: true,
-          pipEnabled: false,
           inPip: false,
           awaitingPrebuffer: false,
           startedPlaying: true,
@@ -112,7 +107,6 @@ void main() {
         expect(
           shouldResyncDecoderOnResume(
             wasBackgrounded: false,
-            pipEnabled: false,
             inPip: false,
             awaitingPrebuffer: false,
             startedPlaying: true,
@@ -130,7 +124,6 @@ void main() {
         expect(
           shouldResyncDecoderOnResume(
             wasBackgrounded: true,
-            pipEnabled: false,
             inPip: false,
             awaitingPrebuffer: false,
             startedPlaying: true,

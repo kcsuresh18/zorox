@@ -421,12 +421,13 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       }
     }
 
-    // +30/+41: the layer must already hold a frame when the app
-    // backgrounds, or a start is refused (the +29 home-swipe
-    // failure). Prime it on entering background (see [autoEnterPiP],
-    // which primes + polls for the start), and flush on become-active
-    // if PiP never started, so no frozen frame lingers on top of the
-    // player.
+    // +55: auto-PiP is REMOVED (user decision 2026-11-16: PiP opens
+    // only when the PiP button is tapped). There is no
+    // didEnterBackground observer at all — a Home swipe must never
+    // open a window on its own, and the +53 first-Home failure that
+    // left the renderer stale cannot happen without an entry to fail.
+    // The manual enter primes via attemptEnter independently, so no
+    // background prime is ever needed.
     // +51: do NOT prime on resign-active. It fires for transient
     // interruptions (Control Center, Notification Center, a call)
     // where the app never backgrounds — and the primed frame renders
@@ -434,28 +435,16 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     // FlutterView, above the Metal layer), showing as a second,
     // wrong-aspect copy (a thin strip) in the middle of the screen
     // for ~1 s after the overlay is dismissed, until the
-    // become-active flush clears it. The prime is only needed when
-    // the app actually backgrounds, and that is covered by
-    // autoEnterPiP on didEnterBackground; manual enter primes via
-    // attemptEnter independently. So there is no resign-active
+    // become-active flush clears it. So there is no resign-active
     // observer at all.
     // didBecomeActive (not willEnterForeground): resign-active also
     // fires for transient interruptions (Control Center, a call) where
     // the app never backgrounds, and only become-active follows those.
-    // +41: entering background also DRIVES the start (see
-    // [autoEnterPiP]) — the canStartPictureInPicture-
-    // AutomaticallyFromInline arm alone never opened the window for
-    // this sample-buffer source, so the start is explicit now.
-    // Main queue: these notifications arrive there.
+    // The become-active flush stays: a failed manual enter can still
+    // leave a prime behind, and it must not linger on top of the
+    // player. Main queue: these notifications arrive there.
     if lifecycleObservers.isEmpty {
       let center = NotificationCenter.default
-      lifecycleObservers.append(
-        center.addObserver(
-          forName: UIApplication.didEnterBackgroundNotification,
-          object: nil,
-          queue: .main
-        ) { [weak self] _ in self?.autoEnterPiP() }
-      )
       lifecycleObservers.append(
         center.addObserver(
           forName: UIApplication.didBecomeActiveNotification,
@@ -496,13 +485,13 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
       }
       lastAppliedPlaying = playing
     }
-    // Auto-PiP arm when the app goes to background, only while
-    // actually playing: a paused film never auto-opens. The flag
+    // +55: auto-PiP is REMOVED — the arm stays off, always. The flag
     // alone never opened the window for this sample-buffer source
-    // (+41) — the start itself is driven explicitly from
-    // didEnterBackground (see [autoEnterPiP]); the flag stays as
-    // belt and braces for the system path.
-    pip?.canStartPictureInPictureAutomaticallyFromInline = playing
+    // (+41), but leaving it armed while playing would let the system
+    // open PiP on its own on some iOS version, and the user wants PiP
+    // ONLY from the button. The button's explicit enter() does not
+    // need the arm (it calls startPictureInPicture directly).
+    pip?.canStartPictureInPictureAutomaticallyFromInline = false
     pip?.invalidatePlaybackState()
   }
 
@@ -530,13 +519,9 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   // 50 ms is ~3 s — 3x the old budget, enough for the cold layer
   // to warm up in one attempt (it warmed within ~2–3 s of
   // cumulative processing across swipes), and still inside the
-  // Dart side's 5 s watchdog. A failed entry leaves the renderer
-  // stale in the background (no PiP keeping it alive, and the +49
-  // resume re-open is gated off while PiP is enabled), so the
-  // return comes back with a blown-out white, frozen-ish picture
-  // and dead touch until another Home → return cycle warms the
-  // layer — the +53 white-video symptom. Opening PiP on the first
-  // Home keeps the decoder/render alive and prevents that state.
+  // Dart side's 5 s watchdog. +55: the poll is button-only now
+  // (automatic PiP removed) — the same cold-layer wait applies to
+  // the first button tap, so the 60-tick budget stays.
   private static let enterPollAttempts = 60
 
   private func enter(_ result: @escaping FlutterResult) {
@@ -587,28 +572,14 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
   /// One tick of the enter() poll. Prime the layer if a newer held
   /// frame arrived since the last prime, then start when possible.
   /// Runs on the main queue (MethodChannel handlers are main-thread).
-  /// `isAuto` is true only for the Home-swipe path (see
-  /// [autoEnterPiP]): if the user came back to the foreground while
-  /// the longer +53 poll was still running, the start must NOT fire
-  /// — a PiP window popping up inside the app is not what auto-PiP
-  /// is for. The button path (isAuto false) is explicitly
-  /// user-initiated in the foreground, so it is unaffected.
+  /// +55: automatic PiP is removed — this poll runs only for the
+  /// manual button path, so there is no auto/foreground distinction
+  /// any more (the old `isAuto` guard is gone with it).
   private func attemptEnter(
     pip: AVPictureInPictureController,
     result: @escaping FlutterResult,
-    attemptsLeft: Int,
-    isAuto: Bool = false
+    attemptsLeft: Int
   ) {
-    // +53: auto-PiP only while backgrounded. The longer poll gives a
-    // returning user time to come back mid-poll; starting PiP then
-    // would open the window on top of the app they just returned to.
-    if isAuto,
-      UIApplication.shared.applicationState == .active
-    {
-      layer?.flushAndRemoveImage()
-      finishEnter(result: result, success: false)
-      return
-    }
     // Keep the layer's image fresh while we wait: a newer prime
     // replaces the stale one.
     if let prime = takePrimeIfNewer() {
@@ -643,8 +614,7 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
         self.attemptEnter(
           pip: pip,
           result: result,
-          attemptsLeft: attemptsLeft - 1,
-          isAuto: isAuto
+          attemptsLeft: attemptsLeft - 1
         )
       }
       return
@@ -696,69 +666,12 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     return true
   }
 
-  /// Auto-PiP prime (+30): the system evaluates auto-PiP as the app
-  /// backgrounds, with no Dart call in between — the layer must already
-  /// hold a frame then, or the system silently skips it (the +29
-  /// home-swipe failure). Only while actually playing: a paused film
-  /// never auto-opens, so no prime is needed. Called ONLY from
-  /// autoEnterPiP on didEnterBackground (+51: never on resign-active —
-  /// a transient interruption primes a frame the user then sees on
-  /// top of the player as a thin strip). The frame is on top of the
-  /// player only while the app is leaving the screen, so the user
-  /// never sees it; clearStalePrime() removes it on foreground return
-  /// if PiP never started.
-  private func primeForBackground() {
-    guard prepared, playing, !pipActive else { return }
-    guard let prime = takePrime(), let layer = layer else { return }
-    syncLayerFrame()
-    enqueuePrime(prime)
-  }
-
-  /// Auto-PiP on Home swipe (+41): drive the start explicitly when
-  /// the app enters the background.
-  ///
-  /// The `canStartPictureInPictureAutomaticallyFromInline` arm (see
-  /// [apply]) never opened the window on its own for this
-  /// sample-buffer content source — the system evaluates auto-PiP at
-  /// the background transition, before the primed frame has been
-  /// processed, so `isPictureInPicturePossible` is still false and
-  /// the start is silently skipped (the +29 home-swipe failure,
-  /// still live in +40). So the start is driven here, through the
-  /// same poll loop the button uses ([attemptEnter]): prime, then
-  /// start when possible. The result is discarded — the open is
-  /// reported through the delegate (`pipStarted`), exactly as for
-  /// the button path.
-  ///
-  /// Only while actually playing: a paused film never auto-opens.
-  /// Never while a window is already up, and never while a manual
-  /// enter is running (`enterPending` serializes the two — the Dart
-  /// `hidden` backup, see the screen, can race this).
-  /// didEnterBackground fires only for a real backgrounding (Home,
-  /// the app switcher, lock); transient overlays (Control Center, a
-  /// call) only resign active, so they never reach this.
-  private func autoEnterPiP() {
-    guard prepared, playing, !pipActive else { return }
-    guard let pip = pip, !pip.isPictureInPictureActive else { return }
-    lock.lock()
-    let already = enterPending
-    if !already { enterPending = true }
-    lock.unlock()
-    guard !already else { return }
-    primeForBackground()
-    attemptEnter(
-      pip: pip,
-      result: { _ in },
-      attemptsLeft: Self.enterPollAttempts,
-      isAuto: true
-    )
-  }
-
   /// Back active without PiP up: a background prime that never became
   /// a window would sit on top of the player as a frozen frame. Flush
   /// it. This also covers transient interruptions (Control Center, a
-  /// call): resign-active primes, become-active follows without any
-  /// foreground transition. Harmless when PiP did start — the live
-  /// feed is already flowing and the flush only clears a stale image.
+  /// call), where become-active follows without any foreground
+  /// transition. Harmless when PiP did start — the live feed is
+  /// already flowing and the flush only clears a stale image.
   private func clearStalePrime() {
     guard !pipActive else { return }
     layer?.flushAndRemoveImage()
@@ -1020,17 +933,6 @@ public class ZoroxMpvPipPlugin: NSObject, FlutterPlugin,
     primeW = tw
     primeH = th
     lock.unlock()
-  }
-
-  /// The current prime buffer, if one is held. The returned buffer is
-  /// never written again — the next refresh writes the other slot —
-  /// so it is safe to enqueue directly. Callers must NOT hold it
-  /// across a release().
-  private func takePrime() -> CVPixelBuffer? {
-    lock.lock()
-    defer { lock.unlock() }
-    guard primeReady else { return nil }
-    return primeBuffers[primeCurrent]
   }
 
   /// The current prime, but only if it is newer than the last one

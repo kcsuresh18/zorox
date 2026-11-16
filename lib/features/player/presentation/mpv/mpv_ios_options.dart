@@ -15,8 +15,9 @@
 /// (timestamp frozen ~5 s, then a ~10 s jump). +49 returns to mpv's
 /// default of 3: a dead session falls back to software after 3 failed
 /// frames (~125 ms), and mpv retains the packets, so there is no skip.
-/// The resume re-open (see [shouldResyncDecoderOnResume]) recreates
-/// the hardware decoder anyway, so a software fallback is only ever a
+/// The hwdec restore on resume (+40 P4) — and, when it fires, the
+/// stall-fallback re-open (see [shouldResyncDecoderOnResume]) — brings
+/// the hardware decoder back, so a software fallback is only ever a
 /// brief bridge, never the rest of the file.
 ///
 /// `framedrop: vo` is mpv's recommended mode (+34, was `decoder+vo`):
@@ -27,25 +28,34 @@
 /// recommended" — the decoder side also skips frames, which costs
 /// decode work for nothing when the bottleneck is the render.
 ///
-/// `cache-secs: 60` (+54) and `demuxer-max-bytes: 512MiB` (+54, was
-/// 256MiB in +34): how far ahead the network cache pre-buffers. mpv's
-/// default `cache-secs` is 10, so it only prefetched ~10 s ahead of the
-/// playhead — on a slow or uneven line that cushion drains in seconds
-/// and the player stalls (user report 2026-11-16: "buffer bohot jaldi
-/// karey agey ka"). 60 s is 6x the read-ahead; at ~25 Mbit/s that is
-/// ~187 MB, at ~50 Mbit/s ~375 MB, so the byte cap is raised to
-/// 512 MiB so it never truncates the 60 s window on high-bitrate 4K
-/// (the old 256 MiB would have capped it at ~41 s at 50 Mbit/s).
-/// Note the effective byte cap was 256 MiB, not the 768 MiB media_kit
-/// sets at player creation from `kMpvBufferSize`: this file's
-/// setProperty runs after creation and overwrites it. Costs only RAM
-/// (a cap, not an allocation — mpv allocates what arrives), and it is
-/// still small against an 8 GB phone. `demuxer-readahead-secs` is NOT
-/// set: under the cache it is ignored (`cache-secs` overrides it when
-/// larger), so it would be a no-op. `cache-pause-initial` is NOT set
-/// either: the Dart-side pre-buffer hold already gates the start, and
-/// making mpv wait for a full 60 s cache before the first frame would
-/// stall the open on a slow source.
+/// `cache-secs: 3600` (+55, was 60 in +54) and `demuxer-max-bytes:
+/// 768MiB` (+55, was 512MiB in +54): how far ahead the network cache
+/// pre-buffers. mpv's default `cache-secs` is 10, so it only prefetched
+/// ~10 s ahead of the playhead — on a slow or uneven line that cushion
+/// drains in seconds and the player stalls (user report 2026-11-16:
+/// "buffer bohot jaldi karey agey ka"). +54 raised it to 60 s, but the
+/// user wants NO time cap at all (2026-11-16: "60 sec nahi jitna sync
+/// karsakega jitne time tak hota rehe"): 3600 s (one hour) means time
+/// never limits the buffer in practice — mpv reads ahead until the
+/// byte cap stops it, i.e. as much as it can sync. The byte cap is the
+/// real limit now, and it is also the safety valve: the cache lives in
+/// RAM, and a cap so large that iOS jetsam-kills the app would be worse
+/// than a stall. 768 MiB holds ~2 min at 50 Mbit/s peak 4K, ~4 min at
+/// 25 Mbit/s, ~10-13 min at 8-10 Mbit/s 1080p — far beyond the 60 s the
+/// user rejected — while keeping the app's total footprint well under
+/// the jetsam limit even on 4 GB phones (his members), and comfortably
+/// so on the user's 8 GB iPhone 15 Pro Max. It is also the size
+/// media_kit already aspired to at player creation (`kMpvBufferSize`),
+/// so it is not a new appetite, just the effective one. Costs only RAM
+/// (a cap, not an allocation — mpv allocates what arrives). Note the
+/// effective byte cap was 256 MiB, not the 768 MiB media_kit sets at
+/// player creation: this file's setProperty runs after creation and
+/// overwrites it. `demuxer-readahead-secs` is NOT set: under the cache
+/// it is ignored (`cache-secs` overrides it when larger), so it would
+/// be a no-op. `cache-pause-initial` is NOT set either: the Dart-side
+/// pre-buffer hold already gates the start, and making mpv wait for a
+/// full cache before the first frame would stall the open on a slow
+/// source.
 ///
 /// The scaler options (+34, the cheap GPU render layer): `scale` /
 /// `cscale` / `dscale: bilinear` is the fastest scaler (the defaults
@@ -82,15 +92,16 @@ import 'package:media_kit/media_kit.dart';
 /// automatically, `reconnect_streamed=1` covers streamed variants, and
 /// `reconnect_delay_max=2` caps the retry delay at 2 s. `network-timeout:
 /// 5` caps a single read at 5 s so a dead socket fails fast instead of
-/// hanging on the OS TCP timeout. They ride along with the resume
-/// re-open (see [shouldResyncDecoderOnResume]): the re-open is the
-/// fresh connection, these are the safety net if a socket dies
-/// mid-stream.
+/// hanging on the OS TCP timeout. They are what makes the plain
+/// pause/resume work (+55): on return mpv re-establishes the dead
+/// socket itself, no re-open needed — the re-open survives only as the
+/// stall fallback (see [shouldResyncDecoderOnResume]). They are also
+/// the safety net if a socket dies mid-stream.
 const Map<String, String> kMpvIosOptions = <String, String>{
   'hwdec-software-fallback': '3',
   'framedrop': 'vo',
-  'demuxer-max-bytes': '512MiB',
-  'cache-secs': '60',
+  'demuxer-max-bytes': '768MiB',
+  'cache-secs': '3600',
   'scale': 'bilinear',
   'cscale': 'bilinear',
   'dscale': 'bilinear',
@@ -132,52 +143,53 @@ bool hwdecSessionLost({required String current}) {
   return !alive.contains(current.trim());
 }
 
-/// Whether the stream needs a re-open on app resume (+48, +49).
+/// Whether the stream needs a re-open as the +55 stall fallback
+/// (+48, +49, +50, +55).
 ///
-/// iOS suspends the VideoToolbox decoder while the app is backgrounded,
-/// and its reference frames go stale — on resume the player restarts
-/// mid-GOP without a valid I-frame reference, so the picture is
-/// macroblocked (and sometimes frozen) until the next keyframe, ~2-4 s
-/// later (user proof 2026-11-16, Other Mommy 1080p, PiP OFF: full-frame
-/// macroblocking + wrong colours at 06:33-06:35, clean by 06:36). The
-/// +40 P4 restore cannot see it: it stands down while the player is
-/// paused (`!_playing` — media_kit does not auto-play on resume,
-/// `resumeUponEnteringForegroundMode` defaults to false), and even when
-/// it runs it stands down while the session is alive
-/// (`hwdec-current == videotoolbox`) — alive is not the same as
-/// in-sync. +48 fixed the macroblocking with a seek to the playhead
-/// (flush the decoder, restart from the nearest keyframe), and the
-/// picture came back clean — but the video stayed laggy and choppy
-/// (user proof 2026-11-16, +48 installed: timestamp frozen at 07:13
-/// for ~5 s, then a ~10 s jump). The seek fixes the decoder but not
-/// the second problem: iOS also kills the HTTP socket while suspended,
-/// so mpv sits in a read timeout before it can serve data again, and
-/// the seek itself throws away the buffered cushion. +49 re-opens the
-/// stream at the playhead instead (same gates): a fresh connection, a
-/// fresh decoder, and the pre-buffer refilled while still paused, so
-/// the first frame after play is clean and the cache is full.
+/// History: iOS suspends the VideoToolbox decoder while the app is
+/// backgrounded, and its reference frames go stale — on resume the
+/// player restarts mid-GOP without a valid I-frame reference, so the
+/// picture is macroblocked (and sometimes frozen) until the next
+/// keyframe, ~2-4 s later (user proof 2026-11-16, Other Mommy 1080p,
+/// PiP OFF: full-frame macroblocking + wrong colours at 06:33-06:35,
+/// clean by 06:36). +48 fixed the macroblocking with a seek to the
+/// playhead, but the video stayed laggy and choppy (user proof
+/// 2026-11-16, +48 installed: timestamp frozen at 07:13 for ~5 s,
+/// then a ~10 s jump) — iOS also kills the HTTP socket while
+/// suspended, so mpv sits in a read timeout before it can serve data
+/// again, and the seek itself throws away the buffered cushion. +49
+/// re-opened the stream at the playhead on every return instead (same
+/// gates): a fresh connection, a fresh decoder, and the pre-buffer
+/// refilled while still paused. But the re-open itself showed
+/// 00:00/LIVE + black + spinner for ~3-4 s on every return (user
+/// proof 2026-11-16, +54 installed), so +55 removed it as the
+/// default: return is a plain pause/resume, and the re-open survives
+/// only as this fallback, fired when the plain resume is verifiably
+/// dead (no position progress 8 s after resume-play — see
+/// `_maybeFallbackReopen` in `mpv_player_screen.dart`).
 ///
 /// Only when the player was actually background-paused: PiP keeps
 /// decoding (no pause, nothing stale), an open landing re-syncs on its
 /// own, and a film that never started has no position to re-open at.
-/// +50: `wasBackgrounded` — the re-open is only for a REAL
+/// +50: `wasBackgrounded` — the fallback is only for a REAL
 /// backgrounding (the app passed through `paused`/`hidden` before this
 /// `resumed`). A transient `inactive` (Control Center, Notification
 /// Center, a call banner) returns to `resumed` without ever
 /// backgrounding — the decoder and the socket were never suspended,
 /// so re-opening would restart the film for nothing (user proof
 /// 2026-11-16, The Odyssey: Control Center pull-down → 00:00/LIVE
-/// restart). Pure, so it is unit-tested (see `mpv_resume_resync_test.dart`).
+/// restart). +55: the old `pipEnabled` gate is gone — with automatic
+/// PiP removed, the setting no longer implies a live window, so only
+/// an actually-open window ([inPip]) skips the fallback. Pure, so it
+/// is unit-tested (see `mpv_resume_resync_test.dart`).
 bool shouldResyncDecoderOnResume({
   required bool wasBackgrounded,
-  required bool pipEnabled,
   required bool inPip,
   required bool awaitingPrebuffer,
   required bool startedPlaying,
   required bool hasStream,
 }) =>
     wasBackgrounded &&
-    !pipEnabled &&
     !inPip &&
     !awaitingPrebuffer &&
     startedPlaying &&

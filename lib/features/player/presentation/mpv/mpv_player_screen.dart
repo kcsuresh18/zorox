@@ -74,7 +74,9 @@ import '../../../../core/storage/episode_watch_repository.dart';
 import '../../../../core/storage/history_repository.dart';
 import '../../../../core/storage/settings_repository.dart';
 import '../../../../l10n/generated/app_localizations.dart';
+import '../../../details/data/metadata_resolution_service.dart';
 import '../../../settings/presentation/player_settings_provider.dart';
+import '../../../skip/data/aniskip_service.dart';
 import '../../../skip/data/skip_service.dart';
 import '../../domain/episode_navigator.dart';
 import '../../domain/episode_duration.dart';
@@ -323,10 +325,14 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   int _prebufferToken = 0;
 
   /// +49: when true, [_startAfterPrebuffer] clears the wait without
-  /// playing — the resume re-open ([_openStream] with `autoPlay: false`)
-  /// refills the cache while the film stays paused, so the viewer taps
-  /// play into a full cushion instead of into a stall. Consumed on the
-  /// first [_startAfterPrebuffer] call; a later open resets it through
+  /// playing — the old resume re-open ([_openStream] with `autoPlay:
+  /// false`) refilled the cache while the film stayed paused, so the
+  /// viewer tapped play into a full cushion instead of into a stall.
+  /// +55 removed that re-open (plain pause/resume now; the stall
+  /// fallback re-opens with `autoPlay: true`, so it plays once the
+  /// pre-buffer refills) — the hold is kept for any future
+  /// `autoPlay: false` open. Consumed on the first
+  /// [_startAfterPrebuffer] call; a later open resets it through
   /// [_waitForPrebuffer], so a normal open always plays.
   bool _prebufferHoldPlay = false;
 
@@ -338,6 +344,29 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// restarts the film for nothing. Set in [didChangeAppLifecycleState];
   /// consumed (and cleared) on every `resumed`.
   bool _appWasBackgrounded = false;
+
+  /// +55: whether the film was actually playing at the moment the app
+  /// went away. Snapshotted in the `inactive` branch — the FIRST
+  /// lifecycle signal, before media_kit pauses on `hidden` and before
+  /// the playing stream can flip [_playing] false — so the `resumed`
+  /// branch knows whether to auto-play again. A film the viewer paused
+  /// himself snapshots false and stays paused on return; a film that
+  /// was playing resumes. Consumed (and cleared) on every `resumed`;
+  /// reset in [_startEpisode].
+  bool _wasPlayingBeforeBackground = false;
+
+  /// +55: the one-shot stall-fallback timer, armed on `resumed` when a
+  /// plain pause/resume starts (see [_maybeFallbackReopen]). If the
+  /// plain resume makes no progress the stream is verifiably dead and
+  /// the timer re-opens it once. Cancelled in [dispose], in
+  /// [_startEpisode], and on the next backgrounding, so a stale timer
+  /// can never re-open a source the viewer has already left.
+  Timer? _resumeStallTimer;
+
+  /// +55: the playhead at the moment the plain resume started playing
+  /// (see [_maybeFallbackReopen]). If the position has not advanced
+  /// past this + 2 s when the stall timer fires, the stream is dead.
+  Duration _resumeStallPosition = Duration.zero;
 
   /// The pre-buffer target and hold cap for the open source, set in
   /// [_openStream]: the ordinary [_kPrebufferTarget]/[_kPrebufferMaxWait],
@@ -469,8 +498,16 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   final ValueNotifier<PanelData> _panelData =
       ValueNotifier<PanelData>(PanelData.empty);
 
-  /// Intro/outro bands, usually empty — both sources are opt-in.
+  /// Intro/outro bands, usually empty. IntroDB (TV/dramas, on by
+  /// default) and AniSkip (anime, +55) fill them in the background;
+  /// a title with no data in either simply has no Skip button.
   List<SkipSegment> _skipSegments = const <SkipSegment>[];
+
+  /// The episode the AniSkip lookup already ran for (see
+  /// [_maybeLoadAniSkip]): the duration listener fires on every
+  /// duration change, and without this the same episode would
+  /// re-fetch on each one.
+  String? _aniskipAttemptedKey;
 
   /// The episode being played, and the route token for it. Both move on an
   /// advance; the panel and the next/previous arrows read them.
@@ -631,6 +668,7 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     WidgetsBinding.instance.removeObserver(this);
     _watchdogTimer?.cancel();
     _prebufferTimer?.cancel();
+    _resumeStallTimer?.cancel();
     _stallTimer?.cancel();
     _thermalTimer?.cancel();
     _mpvStatsTimer?.cancel();
@@ -692,17 +730,19 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     if (_disposed || !mounted) return;
     if (state == AppLifecycleState.inactive) {
       if (defaultTargetPlatform == TargetPlatform.iOS) {
-        // iOS: do NOT start PiP here. `inactive` fires for a transient
-        // overlay too — Control Center, Notification Center, a call — and
-        // starting PiP for one of those would open a window that never
-        // should have existed. Leaving the app for real (Home, the app
-        // switcher) is handled natively instead: the bridge drives the
-        // start explicitly on entering background (see
-        // [ZoroxMpvPipPlugin.autoEnterPiP]), with the Dart `hidden`
-        // branch below as backup. A transient inactive never
-        // backgrounds the app, so the window never opens for Control
-        // Center. The window opening is reported through `pipStarted`,
-        // which is what sets [_inPip].
+        // iOS: `inactive` fires for a transient overlay too — Control
+        // Center, Notification Center, a call — and for a real leaving
+        // (Home, the app switcher) before `hidden`. Nothing opens PiP
+        // here any more: automatic PiP was removed in +55 (user
+        // 2026-11-16: "jab vi pip click karu tabhi pip on ho") — the
+        // native drive (autoEnterPiP) and the Dart `hidden` backup are
+        // both gone, and only the PiP button opens a window. The one
+        // thing `inactive` is good for is the snapshot below: it is
+        // the FIRST signal, before media_kit pauses on `hidden` and
+        // before the playing stream can flip [_playing] false, so it
+        // still holds the pre-background playing state the `resumed`
+        // branch needs (see [_wasPlayingBeforeBackground]).
+        _wasPlayingBeforeBackground = _playing;
       } else {
         // Home swipe / app switcher on Android: the moment to enter PiP.
         // `inactive` is the activity pausing while still visible, so the
@@ -714,25 +754,6 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
         if (!_inPip && _pipAvailable && _playing) {
           unawaited(_enterPip());
         }
-      }
-    }
-    if (state == AppLifecycleState.hidden &&
-        defaultTargetPlatform == TargetPlatform.iOS) {
-      // +41 auto-PiP, Dart-side backup behind the native drive (see
-      // [ZoroxMpvPipPlugin.autoEnterPiP] — it normally wins the
-      // race): `hidden` fires only when the app is really
-      // backgrounded. A transient `inactive` (Control Center,
-      // Notification Center, a call) never reaches it, so no overlay
-      // ever pops a window. The enter guard makes a double start
-      // impossible, and the window opening is reported through
-      // `pipStarted` either way. Same gates as the native side, via
-      // the pure decision in [shouldAutoEnterPip].
-      if (shouldAutoEnterPip(
-        pipAvailable: _pipAvailable,
-        playing: _playing,
-        inPip: _inPip,
-      )) {
-        unawaited(_enterIosMpvPip(fromButton: false));
       }
     }
     if (state == AppLifecycleState.resumed) {
@@ -762,52 +783,114 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       // live decoder and restore it when it is actually lost (see
       // [_restoreHwdecOnResume]) — never when it is healthy.
       unawaited(_restoreHwdecOnResume());
-      // +49: re-open the stream on return from Home (PiP OFF). +48's
-      // seek fixed the macroblocking (the decoder re-syncs from the
-      // nearest keyframe, and the picture came back clean) but the
-      // video stayed laggy and choppy: iOS also kills the HTTP socket
-      // while suspended, so mpv sits in a read timeout before it can
-      // serve data again, and the seek itself throws away the buffered
-      // cushion (user proof 2026-11-16, +48 installed: timestamp
-      // frozen at 07:13 for ~5 s, then a ~10 s jump). A re-open at the
-      // playhead is the superset fix — a fresh connection, a fresh
-      // decoder, and the pre-buffer refilled while still paused
-      // (`autoPlay: false` holds the play, see [_prebufferHoldPlay]),
-      // so the first frame after play is clean and the cache is full.
-      // iOS only, PiP OFF only: PiP keeps decoding, so there is
-      // nothing stale to re-open. P4 stands down while paused, so it
-      // cannot double-fire a re-open here.
-      // +50: gated on a real backgrounding (see [wasBackgrounded]
-      // above) — a Control Center pull-down must not re-open.
+      // +55: NO re-open on return (user 2026-11-16, +54 installed:
+      // every Home → return showed 00:00/LIVE + black + spinner for
+      // ~3-4 s before resuming at the paused position — the +49
+      // re-open itself). Home pauses the film (see the paused/hidden
+      // branch below); return just resumes it from the paused
+      // position — a plain play(), no fresh connection, no restart,
+      // the position stays where it was. Only when the film was
+      // actually playing when the app went away (see
+      // [_wasPlayingBeforeBackground] — a film the viewer paused
+      // himself stays paused) and only after a REAL backgrounding
+      // ([wasBackgrounded] above — a Control Center pull-down must
+      // not auto-play). A PiP window open means the film never
+      // paused, so there is nothing to resume. iOS only: the +49
+      // re-open was iOS-only, and Android's return path is unchanged.
+      // The plain resume relies on mpv's own reconnect
+      // (`reconnect=1`, see [kMpvIosOptions]) to re-establish the
+      // socket iOS killed while suspended. If the stream is
+      // verifiably dead anyway — no position progress 8 s after
+      // resume-play — the stall fallback ([_maybeFallbackReopen])
+      // re-opens it once (the old +49 path, now a fallback, never
+      // the default).
       if (defaultTargetPlatform == TargetPlatform.iOS &&
-          shouldResyncDecoderOnResume(
-            wasBackgrounded: wasBackgrounded,
-            pipEnabled: _iosMpvPipEnabled,
-            inPip: wasInPip,
-            awaitingPrebuffer: _awaitingPrebuffer,
-            startedPlaying: _startedPlaying,
-            hasStream:
-                _streamIndex >= 0 && _streamIndex < _streams.length,
-          )) {
-        debugPrint('[mpv] resume re-open: reopening stream '
-            '$_streamIndex at $_position');
-        unawaited(_openStream(
-          _streamIndex,
-          start: _position,
-          autoPlay: false,
-        ));
+          wasBackgrounded &&
+          !wasInPip &&
+          _wasPlayingBeforeBackground) {
+        debugPrint('[mpv] resume: plain resume from $_position '
+            '(no re-open, +55)');
+        _resumeStallPosition = _position;
+        unawaited(_player.play());
+        // +40 P4: iOS can invalidate the VideoToolbox session while
+        // the app is backgrounded. The early call above stands down
+        // while paused, so this delayed one is what makes the
+        // restore run on a Home → return at all: by the time it
+        // fires, play() has flipped [_playing] true through the
+        // playing stream and the restore can read the live decoder.
+        Future.delayed(const Duration(milliseconds: 500), () {
+          if (!_disposed && mounted) unawaited(_restoreHwdecOnResume());
+        });
+        _resumeStallTimer?.cancel();
+        _resumeStallTimer = Timer(
+          const Duration(seconds: 8),
+          _maybeFallbackReopen,
+        );
       }
+      _wasPlayingBeforeBackground = false;
     }
     // A backstop behind the pause flush: the position at the moment the
     // app goes away is the one Continue Watching must have.
     if (state == AppLifecycleState.paused ||
         state == AppLifecycleState.hidden) {
       // +50: a real backgrounding (not a transient inactive) — the
-      // next `resumed` may run the resume re-open (see
+      // next `resumed` may run the plain resume (see
       // [_appWasBackgrounded]).
       _appWasBackgrounded = true;
       _flushProgress();
+      // +55: Home PAUSES the film (user 2026-11-16: "home se janepe
+      // pause ho"). With automatic PiP removed there is no window any
+      // more to keep it playing, and with the PiP setting ON media_kit's
+      // `pauseUponEnteringBackgroundMode` never fires (see the player
+      // setup) — without this the film would keep playing invisibly in
+      // the background. Never pause under a live PiP window: the window
+      // IS the playback, and pausing would freeze it. A film already
+      // paused is a no-op. The stall-fallback timer from the last
+      // return is cancelled: a new backgrounding starts a fresh cycle.
+      _resumeStallTimer?.cancel();
+      _resumeStallTimer = null;
+      if (!_inPip) {
+        unawaited(_player.pause());
+      }
     }
+  }
+
+  /// +55 stall fallback: the plain pause/resume on Home → return relies
+  /// on mpv's own reconnect (`reconnect=1`, see [kMpvIosOptions]) to
+  /// re-establish the socket iOS killed while suspended. If the stream
+  /// is verifiably dead anyway — the playhead has not advanced 8 s
+  /// after resume-play — re-open it once from the current position
+  /// (the old +49 path, now a fallback, never the default). Runs at
+  /// most once per backgrounding cycle: the one-shot timer is not
+  /// re-armed, and a second backgrounding cancels it first.
+  ///
+  /// 8 s is beyond mpv's own recovery budget (`network-timeout: 5` +
+  /// `reconnect_delay_max: 2`), so a healthy plain resume — which
+  /// starts progressing within a few seconds — never triggers it, and
+  /// a dead one is not left stuck. `autoPlay: true`: the fallback is a
+  /// recovery of a film that was playing, so it comes back playing.
+  void _maybeFallbackReopen() {
+    if (_disposed || !mounted) return;
+    if (!_playing) return; // viewer paused it (or it never resumed).
+    if (_position > _resumeStallPosition + const Duration(seconds: 2)) {
+      return; // progressing — the plain resume worked.
+    }
+    if (!shouldResyncDecoderOnResume(
+      wasBackgrounded: true,
+      inPip: false,
+      awaitingPrebuffer: _awaitingPrebuffer,
+      startedPlaying: _startedPlaying,
+      hasStream: _streamIndex >= 0 && _streamIndex < _streams.length,
+    )) {
+      return;
+    }
+    debugPrint('[mpv] resume stall fallback: no progress 8 s after '
+        'resume-play, re-opening stream $_streamIndex at $_position');
+    unawaited(_openStream(
+      _streamIndex,
+      start: _position,
+      autoPlay: true,
+    ));
   }
 
   void _forceLandscapeIfPortrait() {
@@ -1522,6 +1605,9 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       _player.stream.duration.listen((duration) {
         if (_disposed) return;
         _duration = duration;
+        // The episode length just became known: for anime, that is
+        // what the AniSkip lookup was waiting on (see [_maybeLoadAniSkip]).
+        _maybeLoadAniSkip();
         _syncIosPipState();
         _publishAdapter();
         setState(() {});
@@ -1806,9 +1892,11 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// cache-pause will stall it if the server cannot keep up — same as
   /// before, but now from a cushion rather than from the first frame).
   ///
-  /// +49: `autoPlay: false` (the resume re-open) holds the play — the
-  /// pre-buffer still fills, but [_startAfterPrebuffer] leaves the film
-  /// paused (see [_prebufferHoldPlay]).
+  /// +49: `autoPlay: false` (the old resume re-open) held the play —
+  /// the pre-buffer still filled, but [_startAfterPrebuffer] left the
+  /// film paused (see [_prebufferHoldPlay]). +55 removed that re-open;
+  /// the stall fallback re-opens with `autoPlay: true`, so it plays
+  /// once the pre-buffer refills.
   void _waitForPrebuffer({bool autoPlay = true}) {
     final token = ++_prebufferToken;
     _awaitingPrebuffer = true;
@@ -1836,7 +1924,10 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     _prebufferTimer = null;
     if (_disposed) return;
     if (_prebufferHoldPlay) {
-      // +49 resume re-open: stay paused (see [_prebufferHoldPlay]).
+      // +49 hold: stay paused (see [_prebufferHoldPlay]). No current
+      // caller opens with `autoPlay: false` any more (+55 removed the
+      // resume re-open; the stall fallback re-opens with `autoPlay:
+      // true`), but the hold is kept for any future such open.
       _prebufferHoldPlay = false;
       return;
     }
@@ -2627,12 +2718,64 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// convenience.
   Future<void> _loadSkipSegments(Episode? episode) async {
     if (episode == null) return;
+    // Dramas: IntroDB is keyed by IMDb id, and an item that skipped the
+    // details screen may not have one yet — enrich it first so the
+    // lookup below still finds its intro. Background only, never
+    // awaited by the open path; on any failure the unenriched item is
+    // used as-is and IntroDB simply returns [] without an IMDb id.
+    var item = widget.item;
+    if (item.imdbId == null) {
+      try {
+        item = await ref
+            .read(metadataResolutionServiceProvider)
+            .enrichWithIds(item);
+      } catch (_) {
+        // Keep the original item.
+      }
+    }
     final segments = await fetchSkipSegments(
       read: ref.read,
-      item: widget.item,
+      item: item,
       episode: episode,
     );
+    if (_disposed) return;
+    if (segments.isNotEmpty) {
+      setState(() => _skipSegments = segments);
+    }
+    // Anime: AniSkip needs the episode length, which mpv only learns
+    // once the stream opens — the duration listener below calls
+    // [_maybeLoadAniSkip] when it arrives; this call covers the case
+    // where it is already known.
+    _maybeLoadAniSkip();
+  }
+
+  /// Fetches AniSkip (aniskip.com) OP/ED segments for the current anime
+  /// episode, once per episode, as soon as mpv knows the episode length
+  /// (the API requires it). Called from the duration listener and from
+  /// [_loadSkipSegments]; the attempt key makes repeat calls cheap.
+  void _maybeLoadAniSkip() {
+    final episode = _currentEpisode;
+    if (_disposed || episode == null) return;
+    if (widget.item.contentType != MultimediaContentType.anime) return;
+    if (_duration <= Duration.zero) return;
+    final key =
+        '${widget.item.url}|${episode.url}|${episode.episode}';
+    if (_aniskipAttemptedKey == key) return;
+    _aniskipAttemptedKey = key;
+    unawaited(_loadAniSkipSegments(episode, _duration));
+  }
+
+  Future<void> _loadAniSkipSegments(Episode episode, Duration duration) async {
+    final segments = await ref.read(aniskipServiceProvider).getSkipSegments(
+          malId: AniskipService.malIdFromSyncData(widget.item.syncData),
+          anilistId:
+              AniskipService.anilistIdFromSyncData(widget.item.syncData),
+          episode: episode.episode > 0 ? episode.episode : 1,
+          duration: duration.inSeconds,
+        );
     if (_disposed || segments.isEmpty) return;
+    // Title-specific AniSkip data beats the crowd-averaged IntroDB
+    // answer, the same rule `fetchSkipSegments` applies to AnimeSkip.
     setState(() => _skipSegments = segments);
   }
 
@@ -2755,6 +2898,11 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     _resumePosition = Duration.zero;
     _recorder = null;
     _skipSegments = const <SkipSegment>[];
+    _aniskipAttemptedKey = null;
+    _resumeStallTimer?.cancel();
+    _resumeStallTimer = null;
+    _wasPlayingBeforeBackground = false;
+    _resumeStallPosition = Duration.zero;
     _nextEpisodeOffer = null;
     _nextEpisodeDeclined = false;
     _ended = null;
