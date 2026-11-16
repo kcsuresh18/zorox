@@ -27,11 +27,25 @@
 /// recommended" — the decoder side also skips frames, which costs
 /// decode work for nothing when the bottleneck is the render.
 ///
-/// `demuxer-max-bytes: 256MiB` (+34): the network cache's byte cap
-/// (default 150 MiB). The 20.96 GB file is only ~15 Mbps, but a bigger
-/// headroom rides out throughput dips without a cache stall. Costs only
-/// RAM. `demuxer-readahead-secs` is NOT set: under the cache it is
-/// mostly ignored (`cache-secs` overrides it), so it would be a no-op.
+/// `cache-secs: 60` (+54) and `demuxer-max-bytes: 512MiB` (+54, was
+/// 256MiB in +34): how far ahead the network cache pre-buffers. mpv's
+/// default `cache-secs` is 10, so it only prefetched ~10 s ahead of the
+/// playhead — on a slow or uneven line that cushion drains in seconds
+/// and the player stalls (user report 2026-11-16: "buffer bohot jaldi
+/// karey agey ka"). 60 s is 6x the read-ahead; at ~25 Mbit/s that is
+/// ~187 MB, at ~50 Mbit/s ~375 MB, so the byte cap is raised to
+/// 512 MiB so it never truncates the 60 s window on high-bitrate 4K
+/// (the old 256 MiB would have capped it at ~41 s at 50 Mbit/s).
+/// Note the effective byte cap was 256 MiB, not the 768 MiB media_kit
+/// sets at player creation from `kMpvBufferSize`: this file's
+/// setProperty runs after creation and overwrites it. Costs only RAM
+/// (a cap, not an allocation — mpv allocates what arrives), and it is
+/// still small against an 8 GB phone. `demuxer-readahead-secs` is NOT
+/// set: under the cache it is ignored (`cache-secs` overrides it when
+/// larger), so it would be a no-op. `cache-pause-initial` is NOT set
+/// either: the Dart-side pre-buffer hold already gates the start, and
+/// making mpv wait for a full 60 s cache before the first frame would
+/// stall the open on a slow source.
 ///
 /// The scaler options (+34, the cheap GPU render layer): `scale` /
 /// `cscale` / `dscale: bilinear` is the fastest scaler (the defaults
@@ -75,7 +89,8 @@ import 'package:media_kit/media_kit.dart';
 const Map<String, String> kMpvIosOptions = <String, String>{
   'hwdec-software-fallback': '3',
   'framedrop': 'vo',
-  'demuxer-max-bytes': '256MiB',
+  'demuxer-max-bytes': '512MiB',
+  'cache-secs': '60',
   'scale': 'bilinear',
   'cscale': 'bilinear',
   'dscale': 'bilinear',

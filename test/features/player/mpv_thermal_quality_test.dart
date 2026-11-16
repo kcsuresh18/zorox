@@ -89,7 +89,7 @@ void main() {
     });
 
     test('carries the +34 cache and cheap-GPU-render layers', () {
-      expect(kMpvIosOptions['demuxer-max-bytes'], '256MiB');
+      expect(kMpvIosOptions['demuxer-max-bytes'], '512MiB');
       expect(kMpvIosOptions['scale'], 'bilinear');
       expect(kMpvIosOptions['cscale'], 'bilinear');
       expect(kMpvIosOptions['dscale'], 'bilinear');
@@ -100,6 +100,17 @@ void main() {
       // NOT peak compute: `hdr-compute-peak` (the v20+1 black-screen
       // value) stays out, and media_kit forces it off.
       expect(kMpvIosOptions['tone-mapping'], 'clip');
+    });
+
+    test('pre-buffers 60 s ahead so a slow line does not stall (+54)', () {
+      // mpv's default cache-secs is 10: only ~10 s ahead of the
+      // playhead, so a dip drains it in seconds and the player stalls
+      // (user report 2026-11-16: "buffer bohot jaldi karey agey ka").
+      // 60 s is 6x the read-ahead. The 512 MiB byte cap (above) is
+      // what lets the 60 s window survive on high-bitrate 4K: 60 s at
+      // ~50 Mbit/s is ~375 MB, and the old 256 MiB would have capped
+      // it at ~41 s.
+      expect(kMpvIosOptions['cache-secs'], '60');
     });
 
     test('reconnects a socket iOS killed while suspended (+49)', () {
