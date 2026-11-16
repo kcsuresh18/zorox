@@ -259,7 +259,8 @@ class GoldenPlayerControls extends ConsumerStatefulWidget {
 }
 
 class _GoldenPlayerControlsState
-    extends ConsumerState<GoldenPlayerControls> {
+    extends ConsumerState<GoldenPlayerControls>
+    with WidgetsBindingObserver {
   _GoldenDrawerKind _drawer = _GoldenDrawerKind.none;
 
   /// The speed a 2x hold restores, or null when no hold is down.
@@ -577,11 +578,62 @@ class _GoldenPlayerControlsState
   /// Clears the raw-pinch state: a lock toggle swaps the gesture layer
   /// while fingers are down, so the Listener stops hearing pointer-ups
   /// and stale pointers would otherwise suppress the scale recognizer
-  /// after unlock.
+  /// after unlock. +52: a backgrounding does the same (see
+  /// [didChangeAppLifecycleState]) — so this also drops the consumed
+  /// flag and the pan anchor: without them the next tap still reads as
+  /// a pinch's lift (the tap gate is [_pinchConsumed]) and the next pan
+  /// still measures from a dead down point.
   void _clearRawPinchState() {
     _touches.clear();
     _rawPinching = false;
     _suppressScale = false;
+    _pinchConsumed = false;
+    _pinching = false;
+    _panAnchor = null;
+    _panAnchorLocalX = null;
+    _panAxis = _GoldenPanAxis.none;
+  }
+
+  /// Drops a touch sequence the app's backgrounding interrupted (+52):
+  /// the finger that started the Home swipe never sends its pointer-up,
+  /// so the Listener's [_touches] keeps a stale pointer and the next
+  /// tap reads as a second finger — a phantom pinch that gates the tap
+  /// off (see [didChangeAppLifecycleState]). Ends any rail, swipe-seek
+  /// or 2x hold the sequence owned, the same way a second finger
+  /// landing ends them in [_onPointerDown].
+  void _clearInterruptedGesture() {
+    _clearRawPinchState();
+    _railDragEnd();
+    _cancelSwipeSeek();
+    _endSpeedBoost();
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // +52: a Home swipe (or the app switcher, or a lock) interrupts
+    // the touch sequence in flight — the finger that started the swipe
+    // never sends its pointer-up, because iOS suspends the app
+    // mid-gesture, so the Listener never hears the end. The stale
+    // pointer stays in [_touches], and the next tap's pointer-down
+    // then reads as the SECOND finger of a pinch: [_pinchConsumed]
+    // goes true and the tap (and double-tap, and long-press) is gated
+    // off forever — the video plays but nothing answers a touch,
+    // until something unmounts this widget (a PiP open does, which is
+    // why a second Home → return "fixed" it on the phone, 2026-11-16).
+    // A backgrounding ends every touch sequence by definition, so drop
+    // the interrupted gesture here. `paused`/`hidden` only: a transient
+    // `inactive` (Control Center, a call) still delivers the pointer's
+    // end, so its gestures are left alone.
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      _clearInterruptedGesture();
+    }
   }
 
   /// The single-finger pan (+34: the pinch moved to the Listener — see
@@ -1519,6 +1571,7 @@ class _GoldenPlayerControlsState
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     // A drawer left open holds the chrome; a dispose must not leave the
     // hold standing on the screen's controller.
     if (_drawer != _GoldenDrawerKind.none) {
