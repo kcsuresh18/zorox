@@ -40,5 +40,21 @@ void main() {
       expect(segmentAt(const <SkipSegment>[], const Duration(seconds: 45)),
           isNull);
     });
+
+    test('the reported Attack on Titan case: the playhead inside the OP '
+        'shows the chip (+56)', () {
+      // +56, user proof 2026-11-16: S1E2 at 01:12-01:18 showed no Skip
+      // Intro, although AniSkip reports the OP as 54.312-144.312. The
+      // chip renders exactly when segmentAt finds a segment, so at
+      // 72 s the chip must show — the missing button was the lookup
+      // never running (no MAL id), not the chip.
+      final aotOp = <SkipSegment>[seg(54.312, 144.312)];
+      expect(segmentAt(aotOp, const Duration(seconds: 72)), isNotNull);
+      expect(segmentAt(aotOp, const Duration(seconds: 72))?.type,
+          SkipType.intro);
+      expect(segmentAt(aotOp, const Duration(seconds: 78)), isNotNull);
+      expect(segmentAt(aotOp, const Duration(seconds: 150)), isNull,
+          reason: 'past the OP the chip is gone');
+    });
   });
 }

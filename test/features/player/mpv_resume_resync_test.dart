@@ -134,4 +134,100 @@ void main() {
       },
     );
   });
+
+  group('is4KVideo (+56: the 4K-only reconnect gate)', () {
+    test('3840x2160 is 4K', () {
+      expect(is4KVideo(width: 3840, height: 2160), isTrue);
+    });
+
+    test('4096x2160 (DCI) is 4K', () {
+      expect(is4KVideo(width: 4096, height: 2160), isTrue);
+    });
+
+    test('3840x1600 (ultrawide) is 4K', () {
+      expect(is4KVideo(width: 3840, height: 1600), isTrue);
+    });
+
+    test('2560x1440 is not 4K', () {
+      expect(is4KVideo(width: 2560, height: 1440), isFalse);
+    });
+
+    test('1920x1080 is not 4K', () {
+      expect(is4KVideo(width: 1920, height: 1080), isFalse);
+    });
+
+    test('a lone width or height still decides', () {
+      expect(is4KVideo(width: 3840, height: null), isTrue);
+      expect(is4KVideo(width: null, height: 2160), isTrue);
+      expect(is4KVideo(width: 1920, height: null), isFalse);
+    });
+
+    test('unreadable dimensions are not 4K (plain resume is the safe '
+        'default)', () {
+      expect(is4KVideo(width: null, height: null), isFalse);
+    });
+  });
+
+  group('iosResumeAction (+56: 4K re-opens, everything else plain-resumes)',
+      () {
+    test('4K after a real backgrounding, playing => re-open', () {
+      expect(
+        iosResumeAction(
+          wasBackgrounded: true,
+          inPip: false,
+          wasPlaying: true,
+          is4K: true,
+        ),
+        IosResumeAction.reopen4K,
+      );
+    });
+
+    test('1080p after a real backgrounding, playing => plain resume', () {
+      expect(
+        iosResumeAction(
+          wasBackgrounded: true,
+          inPip: false,
+          wasPlaying: true,
+          is4K: false,
+        ),
+        IosResumeAction.plainResume,
+      );
+    });
+
+    test('not playing => nothing (a film paused by hand stays paused)', () {
+      expect(
+        iosResumeAction(
+          wasBackgrounded: true,
+          inPip: false,
+          wasPlaying: false,
+          is4K: true,
+        ),
+        IosResumeAction.none,
+      );
+    });
+
+    test('PiP window up => nothing (it kept decoding)', () {
+      expect(
+        iosResumeAction(
+          wasBackgrounded: true,
+          inPip: true,
+          wasPlaying: true,
+          is4K: true,
+        ),
+        IosResumeAction.none,
+      );
+    });
+
+    test('no real backgrounding (Control Center) => nothing', () {
+      expect(
+        iosResumeAction(
+          wasBackgrounded: false,
+          inPip: false,
+          wasPlaying: true,
+          is4K: true,
+        ),
+        IosResumeAction.none,
+      );
+    });
+  });
 }

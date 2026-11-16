@@ -78,6 +78,7 @@ import '../../../details/data/metadata_resolution_service.dart';
 import '../../../settings/presentation/player_settings_provider.dart';
 import '../../../skip/data/aniskip_service.dart';
 import '../../../skip/data/skip_service.dart';
+import '../../../tracking/data/simkl_service.dart';
 import '../../domain/episode_navigator.dart';
 import '../../domain/episode_duration.dart';
 import '../../domain/playback_progress.dart';
@@ -509,6 +510,31 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   /// re-fetch on each one.
   String? _aniskipAttemptedKey;
 
+  /// +56: the item after [_loadSkipSegments] enriched it with TMDB/IMDb
+  /// ids. [_maybeLoadAniSkip] reads the ORIGINAL item's sync data, so
+  /// without this the Simkl lookup below would have no ids to ask
+  /// with — the exact gap that left Attack on Titan with no Skip Intro
+  /// on +55 (the plugin files no sync ids, and the enrichment only fed
+  /// IntroDB). Null until the enrichment step runs; reset per episode
+  /// in [_startEpisode].
+  MultimediaItem? _enrichedItem;
+
+  /// +56: the enrichment step in [_loadSkipSegments] has run (whether
+  /// it enriched anything or not). [_maybeLoadAniSkip] defers while
+  /// this is false and the plugin filed no ids, so a title-only
+  /// attempt never resolves through the AniList title search before
+  /// Simkl (the exact lookup) gets its chance.
+  bool _skipEnrichmentDone = false;
+
+  /// +56: the Simkl-resolved sync ids for this title, cached by item
+  /// URL so a series is resolved once, not once per episode. Only a
+  /// successful resolution is cached — a miss is retried next episode,
+  /// same rule as the service caches. NOT reset in [_startEpisode]:
+  /// the URL key is the series, so the resolution survives episode
+  /// advances and is only re-asked for a different title.
+  Map<String, String>? _resolvedSyncIds;
+  String? _resolvedSyncIdsForUrl;
+
   /// The episode being played, and the route token for it. Both move on an
   /// advance; the panel and the next/previous arrows read them.
   Episode? _currentEpisode;
@@ -803,29 +829,17 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       // verifiably dead anyway — no position progress 8 s after
       // resume-play — the stall fallback ([_maybeFallbackReopen])
       // re-opens it once (the old +49 path, now a fallback, never
-      // the default).
-      if (defaultTargetPlatform == TargetPlatform.iOS &&
-          wasBackgrounded &&
-          !wasInPip &&
-          _wasPlayingBeforeBackground) {
-        debugPrint('[mpv] resume: plain resume from $_position '
-            '(no re-open, +55)');
-        _resumeStallPosition = _position;
-        unawaited(_player.play());
-        // +40 P4: iOS can invalidate the VideoToolbox session while
-        // the app is backgrounded. The early call above stands down
-        // while paused, so this delayed one is what makes the
-        // restore run on a Home → return at all: by the time it
-        // fires, play() has flipped [_playing] true through the
-        // playing stream and the restore can read the live decoder.
-        Future.delayed(const Duration(milliseconds: 500), () {
-          if (!_disposed && mounted) unawaited(_restoreHwdecOnResume());
-        });
-        _resumeStallTimer?.cancel();
-        _resumeStallTimer = Timer(
-          const Duration(seconds: 8),
-          _maybeFallbackReopen,
-        );
+      // the default). +56: one exception — 4K (see
+      // [_resumeIosAfterBackground]). The plain resume lags at 4K
+      // bitrates on a stale decoder/socket while 1080p recovers, so
+      // a 4K track re-opens the source on return; everything below
+      // 4K keeps the plain resume above.
+      if (defaultTargetPlatform == TargetPlatform.iOS) {
+        unawaited(_resumeIosAfterBackground(
+          wasBackgrounded: wasBackgrounded,
+          wasInPip: wasInPip,
+          wasPlaying: _wasPlayingBeforeBackground,
+        ));
       }
       _wasPlayingBeforeBackground = false;
     }
@@ -853,6 +867,105 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
         unawaited(_player.pause());
       }
     }
+  }
+
+  /// +56: the iOS Home → return after a real backgrounding, 4K-aware
+  /// (user 2026-11-16: "only 4k videos hi ... source reconnect
+  /// hojaye ... baki sab ... reconnect naho"). Implements the decision
+  /// table in [iosResumeAction] — the early return is its `none`, the
+  /// 4K branch its `reopen4K`, the fall-through its `plainResume`.
+  ///
+  /// 4K re-opens the source at the paused position and plays once the
+  /// pre-buffer refills (the +49 shape, `autoPlay: true` — the film
+  /// comes back playing, as +55 promised), because the plain resume
+  /// lags at 4K bitrates on a stale decoder/socket while 1080p
+  /// recovers. The re-open DOES show the 00:00/LIVE + black + spinner
+  /// briefly on return — the trade-off the user chose for 4K only —
+  /// and it arms NO stall timer: the re-open IS the recovery, and a
+  /// second re-open 8 s later would just replay the reconnect for a
+  /// stream that is already fresh (a re-opened stream that is itself
+  /// dead is mpv's own reconnect's job, not a second re-open's).
+  /// Everything below 4K takes the +55 plain resume: a plain play()
+  /// from the paused position, the delayed HW restore, and the 8 s
+  /// stall fallback.
+  Future<void> _resumeIosAfterBackground({
+    required bool wasBackgrounded,
+    required bool wasInPip,
+    required bool wasPlaying,
+  }) async {
+    if (_disposed || !mounted) return;
+    if (!wasBackgrounded || wasInPip || !wasPlaying) return;
+    final is4K = await _isCurrentVideo4K();
+    if (_disposed || !mounted) return;
+    if (is4K) {
+      debugPrint('[mpv] resume: 4K, re-opening stream $_streamIndex '
+          'at $_position (+56)');
+      _resumeStallTimer?.cancel();
+      _resumeStallTimer = null;
+      unawaited(_openStream(
+        _streamIndex,
+        start: _position,
+        autoPlay: true,
+      ));
+      return;
+    }
+    debugPrint('[mpv] resume: plain resume from $_position '
+        '(no re-open, +55)');
+    _resumeStallPosition = _position;
+    unawaited(_player.play());
+    // +40 P4: iOS can invalidate the VideoToolbox session while
+    // the app is backgrounded. The early call above stands down
+    // while paused, so this delayed one is what makes the
+    // restore run on a Home → return at all: by the time it
+    // fires, play() has flipped [_playing] true through the
+    // playing stream and the restore can read the live decoder.
+    Future.delayed(const Duration(milliseconds: 500), () {
+      if (!_disposed && mounted) unawaited(_restoreHwdecOnResume());
+    });
+    _resumeStallTimer?.cancel();
+    _resumeStallTimer = Timer(
+      const Duration(seconds: 8),
+      _maybeFallbackReopen,
+    );
+  }
+
+  /// +56: is the video track currently decoding 4K? Reads the live
+  /// `video-params` size — the ground truth of what is decoding, not
+  /// the source row's label (a mislabelled 1080p file must not
+  /// reconnect). When the properties are unreadable — a decoder too
+  /// stale to answer — falls back to the source row's label
+  /// ([isHighBitrateStream]): a 4K-labelled source with unreadable
+  /// video-params is exactly the stale-decoder case the re-open
+  /// fixes. Never throws; false on any failure (the plain resume is
+  /// the safe default — only a proven 4K reconnects).
+  Future<bool> _isCurrentVideo4K() async {
+    try {
+      final platform = _player.platform;
+      if (platform is NativePlayer) {
+        final width = _parseVideoParam(
+          await platform.getProperty('video-params/w'),
+        );
+        final height = _parseVideoParam(
+          await platform.getProperty('video-params/h'),
+        );
+        if (width != null || height != null) {
+          return is4KVideo(width: width, height: height);
+        }
+      }
+    } catch (_) {
+      // Fall through to the label.
+    }
+    return _streamIndex >= 0 &&
+        _streamIndex < _streams.length &&
+        isHighBitrateStream(_streams[_streamIndex]);
+  }
+
+  /// Parses an mpv video-param size: an int, or a numeric string
+  /// ("3840", or "3840.0" from a double-typed read).
+  static int? _parseVideoParam(dynamic value) {
+    if (value is num) return value.toInt();
+    final parsed = double.tryParse(value.toString());
+    return parsed?.toInt();
   }
 
   /// +55 stall fallback: the plain pause/resume on Home → return relies
@@ -2733,6 +2846,15 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
         // Keep the original item.
       }
     }
+    // +56: keep the enriched item for the AniSkip lookup below (see
+    // [_enrichedItem]): Simkl needs its tmdbId/imdbId, and the
+    // original item has neither when the plugin filed no sync ids.
+    // Set even when enrichment changed nothing, so [_maybeLoadAniSkip]
+    // knows the ids are final and stops deferring.
+    if (!_disposed) {
+      _enrichedItem = item;
+      _skipEnrichmentDone = true;
+    }
     final segments = await fetchSkipSegments(
       read: ref.read,
       item: item,
@@ -2758,6 +2880,19 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     if (_disposed || episode == null) return;
     if (widget.item.contentType != MultimediaContentType.anime) return;
     if (_duration <= Duration.zero) return;
+    // +56: the plugin filed no MAL/AniList id and the enrichment has
+    // not finished yet — do NOT consume the attempt. The trailing call
+    // in [_loadSkipSegments] runs the full chain once the ids are in;
+    // a title-only attempt now would resolve through the AniList title
+    // search before Simkl (the exact lookup, by tmdbId/imdbId) ever
+    // got its chance. When the plugin DID file an id, or enrichment
+    // is done, there is nothing to wait for.
+    final sync = widget.item.syncData;
+    if (AniskipService.malIdFromSyncData(sync) == null &&
+        AniskipService.anilistIdFromSyncData(sync) == null &&
+        !_skipEnrichmentDone) {
+      return;
+    }
     final key =
         '${widget.item.url}|${episode.url}|${episode.episode}';
     if (_aniskipAttemptedKey == key) return;
@@ -2766,17 +2901,69 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
   }
 
   Future<void> _loadAniSkipSegments(Episode episode, Duration duration) async {
-    final segments = await ref.read(aniskipServiceProvider).getSkipSegments(
-          malId: AniskipService.malIdFromSyncData(widget.item.syncData),
-          anilistId:
-              AniskipService.anilistIdFromSyncData(widget.item.syncData),
-          episode: episode.episode > 0 ? episode.episode : 1,
-          duration: duration.inSeconds,
-        );
+    // +56: the MAL id the player asks AniSkip with. The plugin's own
+    // sync data wins when it filed one; otherwise the id is resolved
+    // here, in the player — Simkl on the enriched item (the details
+    // screen's proven path), then the AniList title search inside the
+    // service as a last resort. Miruro/Anikoto file no sync ids at
+    // all, so without this the lookup never ran and no button ever
+    // appeared (Attack on Titan S1E2 on +55: AniSkip HAS the OP data,
+    // the app never asked).
+    final service = ref.read(aniskipServiceProvider);
+    final sync = widget.item.syncData;
+    var malId = AniskipService.malIdFromSyncData(sync);
+    var anilistId = AniskipService.anilistIdFromSyncData(sync);
+    if (malId == null && anilistId == null) {
+      final resolved = await _resolveSyncIdsViaSimkl();
+      if (resolved != null) {
+        malId = AniskipService.malIdFromSyncData(resolved);
+        anilistId = AniskipService.anilistIdFromSyncData(resolved);
+      }
+    }
+    final segments = await service.getSkipSegments(
+      malId: malId,
+      anilistId: anilistId,
+      title: widget.item.title,
+      episode: episode.episode > 0 ? episode.episode : 1,
+      duration: duration.inSeconds,
+    );
     if (_disposed || segments.isEmpty) return;
     // Title-specific AniSkip data beats the crowd-averaged IntroDB
     // answer, the same rule `fetchSkipSegments` applies to AnimeSkip.
     setState(() => _skipSegments = segments);
+  }
+
+  /// +56: Simkl sync ids for this title, on the enriched item
+  /// ([_enrichedItem] — its tmdbId/imdbId are what Simkl is looked up
+  /// by, exactly as the details screen does it). Cached per item URL
+  /// so a series is resolved once, not once per episode; only a
+  /// successful resolution is cached. Null when there is nothing to
+  /// look up with, when Simkl finds nothing, or on any error — the
+  /// AniList title search in the service is the fallback then, and a
+  /// title Simkl cannot resolve is retried next episode rather than
+  /// cached as a miss.
+  Future<Map<String, String>?> _resolveSyncIdsViaSimkl() async {
+    if (_resolvedSyncIdsForUrl == widget.item.url &&
+        _resolvedSyncIds != null) {
+      return _resolvedSyncIds;
+    }
+    final enriched = _enrichedItem ?? widget.item;
+    if (enriched.tmdbId == null && enriched.imdbId == null) return null;
+    try {
+      final resolved =
+          await ref.read(simklServiceProvider).syncIds(enriched);
+      if (resolved.isNotEmpty) {
+        _resolvedSyncIds = resolved;
+        _resolvedSyncIdsForUrl = widget.item.url;
+        return resolved;
+      }
+      return null;
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('AniSkip: Simkl id lookup failed: $e');
+      }
+      return null;
+    }
   }
 
   // -- panel ---------------------------------------------------------------
@@ -2899,6 +3086,8 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     _recorder = null;
     _skipSegments = const <SkipSegment>[];
     _aniskipAttemptedKey = null;
+    _enrichedItem = null;
+    _skipEnrichmentDone = false;
     _resumeStallTimer?.cancel();
     _resumeStallTimer = null;
     _wasPlayingBeforeBackground = false;

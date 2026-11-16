@@ -13,12 +13,14 @@
 /// every failure path returns an empty list, never throws, and the
 /// player shows no button and no error.
 ///
-/// The MAL id comes from the plugin's sync ids when it filed one, and
-/// otherwise from AniList's public GraphQL API (`Media(id) { idMal }`,
-/// no key), because the plugins file AniList ids far more often than
-/// MAL ids. The episode length is required by the AniSkip API, so the
-/// player only asks once mpv knows it (see `_maybeLoadAniSkip` in the
-/// mpv screen).
+/// The MAL id comes from the plugin's sync ids when it filed one.
+/// When it filed none — Miruro/Anikoto file none at all — the player
+/// resolves one first through Simkl (by TMDB/IMDb id, the details
+/// screen's proven path; see `_loadAniSkipSegments` in the mpv
+/// screen), and this service's last resort is an AniList title search
+/// (`Media(search:) { idMal }`, no key). The episode length is
+/// required by the AniSkip API, so the player only asks once mpv
+/// knows it (see `_maybeLoadAniSkip` in the mpv screen).
 library;
 
 import 'dart:collection';
@@ -51,6 +53,11 @@ class AniskipService {
   static const Duration _cacheTtl = Duration(hours: 1);
   static final LinkedHashMap<int, _CachedMal> _malCache =
       LinkedHashMap<int, _CachedMal>();
+  // Title-search resolutions, keyed by the lower-cased title: the last
+  // resort, so it is cached the same way (1 h) rather than searched
+  // again on every episode of a series the ids never named.
+  static final LinkedHashMap<String, _CachedMal> _malCacheByTitle =
+      LinkedHashMap<String, _CachedMal>();
   static final LinkedHashMap<String, _CachedSegments> _segmentsCache =
       LinkedHashMap<String, _CachedSegments>();
 
@@ -72,17 +79,24 @@ class AniskipService {
 
   /// Skip segments for [episode] of an anime title.
   ///
-  /// [malId] wins when the plugin filed one; otherwise [anilistId] is
-  /// resolved to a MAL id through AniList. Returns [] when no MAL id
+  /// Resolution order: [malId] when the plugin filed one; otherwise
+  /// [anilistId] resolved to a MAL id through AniList; otherwise
+  /// [title] resolved through an AniList title search (the last
+  /// resort — a title search is fuzzy where the ids are exact, so it
+  /// only runs when no id resolved). Returns [] when no MAL id
   /// resolves, when AniSkip has no data for the episode, or on any
   /// error.
   Future<List<SkipSegment>> getSkipSegments({
     int? malId,
     int? anilistId,
+    String? title,
     required int episode,
     required int duration,
   }) async {
-    final resolvedMalId = malId ?? await _resolveMalId(anilistId);
+    final resolvedMalId =
+        malId ??
+        await _resolveMalId(anilistId) ??
+        await _resolveMalIdByTitle(title);
     if (resolvedMalId == null) return const [];
 
     final key = '$resolvedMalId:$episode';
@@ -119,6 +133,42 @@ class AniskipService {
     } catch (e) {
       if (kDebugMode) {
         debugPrint('AniSkip: AniList idMal lookup failed: $e');
+      }
+      return null;
+    }
+  }
+
+  /// Title → MAL id through an AniList title search (no key). The
+  /// last resort (+56): when the plugin filed no ids and Simkl (in
+  /// the player) could not resolve one either, the title is all there
+  /// is. A search is fuzzy where an id is exact — "Attack on Titan"
+  /// answers MAL 16498, but a sequel or a same-named title could
+  /// answer wrong — so it only runs after the id paths fail, and only
+  /// a successful resolution is cached (same rule as [_resolveMalId]).
+  Future<int?> _resolveMalIdByTitle(String? title) async {
+    final query = title?.trim();
+    if (query == null || query.isEmpty) return null;
+    final key = query.toLowerCase();
+    final cached = _lookupMalByTitle(key);
+    if (cached != null) return cached;
+    try {
+      final response = await _dio.post<Map<String, dynamic>>(
+        'https://graphql.anilist.co',
+        data: {
+          'query':
+              r'query ($search: String) { Media(search: $search, type: ANIME) { idMal } }',
+          'variables': {'search': query},
+        },
+      );
+      final idMal = response.data?['data']?['Media']?['idMal'];
+      final mal = idMal is num
+          ? idMal.toInt()
+          : int.tryParse(idMal?.toString() ?? '');
+      if (mal != null) _storeMalByTitle(key, mal);
+      return mal;
+    } catch (e) {
+      if (kDebugMode) {
+        debugPrint('AniSkip: AniList title search failed: $e');
       }
       return null;
     }
@@ -192,6 +242,27 @@ class AniskipService {
     _malCache[anilistId] = _CachedMal(malId, DateTime.now().add(_cacheTtl));
     while (_malCache.length > _cacheMax) {
       _malCache.remove(_malCache.keys.first);
+    }
+  }
+
+  int? _lookupMalByTitle(String titleKey) {
+    final entry = _malCacheByTitle[titleKey];
+    if (entry == null) return null;
+    if (DateTime.now().isAfter(entry.expiresAt)) {
+      _malCacheByTitle.remove(titleKey);
+      return null;
+    }
+    _malCacheByTitle.remove(titleKey);
+    _malCacheByTitle[titleKey] = entry;
+    return entry.malId;
+  }
+
+  void _storeMalByTitle(String titleKey, int malId) {
+    _malCacheByTitle.remove(titleKey);
+    _malCacheByTitle[titleKey] =
+        _CachedMal(malId, DateTime.now().add(_cacheTtl));
+    while (_malCacheByTitle.length > _cacheMax) {
+      _malCacheByTitle.remove(_malCacheByTitle.keys.first);
     }
   }
 

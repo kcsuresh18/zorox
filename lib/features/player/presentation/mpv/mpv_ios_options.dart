@@ -195,6 +195,54 @@ bool shouldResyncDecoderOnResume({
     startedPlaying &&
     hasStream;
 
+/// Whether the video track currently decoding is 4K (+56).
+///
+/// The gate for the 4K-only reconnect on Home → return (user
+/// 2026-11-16: "only 4k videos hi ... source reconnect hojaye ...
+/// baki sab ... reconnect naho"): a 4K track re-opens the source on
+/// return, because the plain pause/resume lags at 4K bitrates on a
+/// stale decoder/socket while 1080p recovers; 1440p and below stay on
+/// the plain resume. Either dimension proves it: 3840 wide (UHD,
+/// including ultrawide 3840x1600) or 2160 tall (DCI 4096x2160). Null
+/// dimensions — an unreadable property — prove nothing, so they read
+/// as not-4K; the caller falls back to the source row's label there
+/// (see [_isCurrentVideo4K] in `mpv_player_screen.dart`). Pure, so it
+/// is unit-tested (see `mpv_resume_resync_test.dart`).
+bool is4KVideo({required int? width, required int? height}) =>
+    (width != null && width >= 3840) || (height != null && height >= 2160);
+
+/// What the iOS Home → return does after a real backgrounding (+56).
+enum IosResumeAction {
+  /// Re-open the source at the paused position and play once the
+  /// pre-buffer refills (4K only).
+  reopen4K,
+
+  /// Plain play() from the paused position (everything below 4K).
+  plainResume,
+
+  /// Nothing: the film was not playing, a PiP window is up, or the
+  /// return was a transient inactive (Control Center).
+  none,
+}
+
+/// The iOS Home → return decision (+56): 4K re-opens, everything else
+/// plain-resumes, and a film that was not playing, a live PiP window,
+/// or a return without a real backgrounding does nothing. The player
+/// implements this table in [_resumeIosAfterBackground] (its early
+/// return is [IosResumeAction.none], its 4K branch
+/// [IosResumeAction.reopen4K], its fall-through
+/// [IosResumeAction.plainResume]). Pure, so it is unit-tested (see
+/// `mpv_resume_resync_test.dart`).
+IosResumeAction iosResumeAction({
+  required bool wasBackgrounded,
+  required bool inPip,
+  required bool wasPlaying,
+  required bool is4K,
+}) {
+  if (!wasBackgrounded || inPip || !wasPlaying) return IosResumeAction.none;
+  return is4K ? IosResumeAction.reopen4K : IosResumeAction.plainResume;
+}
+
 /// Applies [kMpvIosOptions] to a player's mpv instance, then reads the
 /// fallback back so the log shows what was set. Same best-effort shape
 /// as [applyMpvAndroidOptions] in `mpv_android_options.dart`: a single
