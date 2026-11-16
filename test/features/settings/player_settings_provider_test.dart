@@ -27,6 +27,10 @@ const String _source =
 const Set<String> _fieldlessByDesign = <String>{
   'clearPreferredPlayer',
   'clearBufferOverride',
+  // +57: the Custom preset's stored values are nullable fields; the
+  // flags clear them (a null value alone cannot, it means "keep").
+  'clearVideoCustomToneMapping',
+  'clearVideoCustomTargetPeak',
 };
 
 /// Every read refuses, the way a Linux box with no libsecret does.

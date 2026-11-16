@@ -112,6 +112,49 @@ enum PlayerEngine {
   vlc,
 }
 
+/// Which output preset the iOS mpv player's Video panel applies (+57).
+///
+/// The panel (Infuse-style, GoldenPlayerControls → GoldenVideoDrawer)
+/// offers four presets; the choice is stored by name and applied to the
+/// live mpv instance at once (see `videoOutputPresetOptions` in
+/// `mpv_ios_options.dart`) and again on the next open, when the screen
+/// applies the stored preset at setup. iOS mpv only — Android has no
+/// Video button and never reads this.
+///
+/// True EDR passthrough is impossible through the 8-bit Flutter texture
+/// on either render path, so "Native EDR" is the closest achievable
+/// behaviour (no tone-mapping curve), not real EDR — see the per-value
+/// notes. `hdr-compute-peak` is never set by any preset: it blacks the
+/// video with vo=libmpv (media_kit forces it off).
+enum VideoOutputPreset {
+  /// Closest to HDR passthrough: no tone-mapping curve, hard clip at
+  /// peak white (`tone-mapping: clip` on the hardware path, the clip LUT
+  /// on the software path). The default: it IS the behaviour every
+  /// install already had (clip on both paths since +50), so an upgrade
+  /// changes nothing.
+  nativeEdr,
+
+  /// The reference SDR tone-mapping curve: `tone-mapping: bt.2390` on the
+  /// hardware path, the BT.2390 EETF LUT on the software path — both
+  /// paths roll highlights off identically, so PiP ON matches PiP OFF.
+  /// More predictable whites and blacks than the clip.
+  sdrToneMapped,
+
+  /// mpv's own defaults, no custom tone mapping: `tone-mapping: auto`
+  /// (which maps to bt.2390 on vo=gpu) plus the default scalers
+  /// (lanczos / hermite, dither auto, correct downscaling on) — the
+  /// render the app had before the +34 cheap-scalers. The curve is the
+  /// same as SDR tone mapped; the scalers are what differ. Costs more
+  /// GPU than the other presets; the thermal governor does not touch the
+  /// scalers, so this stays as picked until the viewer changes it.
+  compatibility,
+
+  /// The stored advanced values ([videoCustomToneMapping] /
+  /// [videoCustomTargetPeak]); with none stored it behaves as Native EDR.
+  /// Advanced controls follow in a later build.
+  custom,
+}
+
 class PlayerSettings {
   final PlayerGesture leftGesture;
   final PlayerGesture rightGesture;
@@ -256,6 +299,19 @@ class PlayerSettings {
   /// renderer.
   final bool iosMpvPip;
 
+  /// The Video output preset (+57). Default Native EDR: it is the
+  /// behaviour every install already had (clip on both paths since +50),
+  /// so an upgrade changes nothing. See [VideoOutputPreset].
+  final VideoOutputPreset videoOutputPreset;
+
+  /// The Custom preset's stored tone-mapping value, or null when the
+  /// viewer has never set one (Custom then behaves as Native EDR).
+  /// Advanced controls follow in a later build.
+  final String? videoCustomToneMapping;
+
+  /// The Custom preset's stored target peak, or null when never set.
+  final String? videoCustomTargetPeak;
+
   // Subtitle Accounts
   final String osUsername;
   final String osPassword;
@@ -303,6 +359,9 @@ class PlayerSettings {
     this.autoSkip = true,
     this.playerEngine = PlayerEngine.mpv,
     this.iosMpvPip = false,
+    this.videoOutputPreset = VideoOutputPreset.nativeEdr,
+    this.videoCustomToneMapping,
+    this.videoCustomTargetPeak,
     this.osUsername = '',
     this.osPassword = '',
     this.osApiKey = '',
@@ -352,6 +411,11 @@ class PlayerSettings {
     bool? autoSkip,
     PlayerEngine? playerEngine,
     bool? iosMpvPip,
+    VideoOutputPreset? videoOutputPreset,
+    String? videoCustomToneMapping,
+    bool clearVideoCustomToneMapping = false,
+    String? videoCustomTargetPeak,
+    bool clearVideoCustomTargetPeak = false,
     String? osUsername,
     String? osPassword,
     String? osApiKey,
@@ -405,6 +469,13 @@ class PlayerSettings {
       autoSkip: autoSkip ?? this.autoSkip,
       playerEngine: playerEngine ?? this.playerEngine,
       iosMpvPip: iosMpvPip ?? this.iosMpvPip,
+      videoOutputPreset: videoOutputPreset ?? this.videoOutputPreset,
+      videoCustomToneMapping: clearVideoCustomToneMapping
+          ? null
+          : (videoCustomToneMapping ?? this.videoCustomToneMapping),
+      videoCustomTargetPeak: clearVideoCustomTargetPeak
+          ? null
+          : (videoCustomTargetPeak ?? this.videoCustomTargetPeak),
       osUsername: osUsername ?? this.osUsername,
       osPassword: osPassword ?? this.osPassword,
       osApiKey: osApiKey ?? this.osApiKey,
@@ -660,6 +731,24 @@ class PlayerSettingsNotifier extends _$PlayerSettingsNotifier {
         ) ??
         false;
 
+    // Video output preset (+57): stored by enum name; an unknown name —
+    // written by a newer build, or a corrupted box — reads back as
+    // Native EDR, the behaviour every install already had.
+    final videoOutputPreset = VideoOutputPreset.values.firstWhere(
+      (e) =>
+          e.name ==
+          storage.getPlayerSetting<String>('player_video_output_preset'),
+      orElse: () => VideoOutputPreset.nativeEdr,
+    );
+    // The Custom preset's stored advanced values; null when never set
+    // (Custom then behaves as Native EDR).
+    final videoCustomToneMapping = storage.getPlayerSetting<String>(
+      'player_video_custom_tone_mapping',
+    );
+    final videoCustomTargetPeak = storage.getPlayerSetting<String>(
+      'player_video_custom_target_peak',
+    );
+
     // No defaultValue: an absent key has to stay absent, because null is what
     // Auto is stored as. The old key, player_network_buffer_mb, is never read.
     final bufferOverrideMb = storage.getPlayerSetting<int>(
@@ -709,6 +798,9 @@ class PlayerSettingsNotifier extends _$PlayerSettingsNotifier {
       autoSkip: autoSkip,
       playerEngine: playerEngine,
       iosMpvPip: iosMpvPip,
+      videoOutputPreset: videoOutputPreset,
+      videoCustomToneMapping: videoCustomToneMapping,
+      videoCustomTargetPeak: videoCustomTargetPeak,
       osUsername: osUser,
       osApiKey: osKey,
       subdlEmail: dlEmail,
@@ -896,6 +988,49 @@ class PlayerSettingsNotifier extends _$PlayerSettingsNotifier {
   Future<void> setIosMpvPip(bool value) async {
     await _repository.setPlayerSetting('player_ios_mpv_pip', value);
     _update((PlayerSettings c) => c.copyWith(iosMpvPip: value));
+  }
+
+  /// The Video output preset (+57). Stored by enum name; an unknown name
+  /// reads back as Native EDR (see the load above). The player screen
+  /// applies it to the live mpv instance at once (see
+  /// `_applyVideoOutputPreset` in `mpv_player_screen.dart`); the setting
+  /// itself also takes effect on the next open, because the screen
+  /// applies the stored preset at setup.
+  Future<void> setVideoOutputPreset(VideoOutputPreset preset) async {
+    await _repository.setPlayerSetting(
+      'player_video_output_preset',
+      preset.name,
+    );
+    _update((PlayerSettings c) => c.copyWith(videoOutputPreset: preset));
+  }
+
+  /// The Custom preset's stored tone-mapping value. Advanced controls
+  /// follow in a later build; nothing writes this yet. Null clears it.
+  Future<void> setVideoCustomToneMapping(String? value) async {
+    await _repository.setPlayerSetting(
+      'player_video_custom_tone_mapping',
+      value,
+    );
+    _update(
+      (PlayerSettings c) => c.copyWith(
+        videoCustomToneMapping: value,
+        clearVideoCustomToneMapping: value == null,
+      ),
+    );
+  }
+
+  /// The Custom preset's stored target peak. Null clears it.
+  Future<void> setVideoCustomTargetPeak(String? value) async {
+    await _repository.setPlayerSetting(
+      'player_video_custom_target_peak',
+      value,
+    );
+    _update(
+      (PlayerSettings c) => c.copyWith(
+        videoCustomTargetPeak: value,
+        clearVideoCustomTargetPeak: value == null,
+      ),
+    );
   }
 
   Future<void> setSubtitleSettings(

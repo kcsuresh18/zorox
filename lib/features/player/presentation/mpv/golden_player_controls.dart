@@ -57,6 +57,7 @@ import '../vlc/transient_overlay.dart';
 import 'golden_drawer.dart';
 import 'golden_episodes_drawer.dart';
 import 'golden_options_drawer.dart';
+import 'golden_video_drawer.dart';
 import 'golden_player_theme.dart';
 import 'golden_subtitle_style_drawer.dart';
 
@@ -64,7 +65,7 @@ import 'golden_subtitle_style_drawer.dart';
 const Duration _kGoldenSeekStep = Duration(seconds: 10);
 
 /// Which right-side drawer is open, if any.
-enum _GoldenDrawerKind { none, episodes, subtitleStyle, audio, sources }
+enum _GoldenDrawerKind { none, episodes, subtitleStyle, audio, sources, video }
 
 /// The axis a single-finger pan has committed to, if any.
 ///
@@ -180,6 +181,7 @@ class GoldenPlayerControls extends ConsumerStatefulWidget {
     this.locked,
     this.lockAvailable = true,
     this.onEnterPip,
+    this.onVideoPresetChanged,
     super.key,
   });
 
@@ -252,6 +254,12 @@ class GoldenPlayerControls extends ConsumerStatefulWidget {
   /// is on — the same gate as the stock chrome. Null on TV, and on iOS
   /// when the mpv PiP setting is off (see the screen's `_pipAvailable`).
   final VoidCallback? onEnterPip;
+
+  /// Applies a Video output preset to the live mpv instance (+57).
+  /// Non-null on iOS (the Video panel is iOS mpv only); null on Android,
+  /// where the button never renders. The drawer persists the choice
+  /// through [settingsNotifier] itself — this only applies it live.
+  final ValueChanged<VideoOutputPreset>? onVideoPresetChanged;
 
   @override
   ConsumerState<GoldenPlayerControls> createState() =>
@@ -1376,6 +1384,16 @@ class _GoldenPlayerControlsState
                                   ),
                                   onOpenSources: () =>
                                       _openDrawer(_GoldenDrawerKind.sources),
+                                  // Video output presets (+57): the
+                                  // button renders only where the screen
+                                  // offers a live preset apply (iOS mpv);
+                                  // null on Android.
+                                  onOpenVideo:
+                                      widget.onVideoPresetChanged != null
+                                      ? () => _openDrawer(
+                                          _GoldenDrawerKind.video,
+                                        )
+                                      : null,
                                   onPickVolume: _pickVolume,
                                   // While a 2x hold is down, the chip shows
                                   // the speed the hold will restore (1x) —
@@ -1563,6 +1581,24 @@ class _GoldenPlayerControlsState
             _closeDrawer();
             widget.onPickSource(index);
           },
+        );
+      case _GoldenDrawerKind.video:
+        // Video output presets (+57): the drawer persists the pick
+        // through the settings notifier and the screen applies it to
+        // the live mpv instance at once, so the picture changes on
+        // the current video. The notifier set is unawaited — the Hive
+        // write completes in the background and the drawer rebuilds
+        // from the live settings value.
+        return GoldenVideoDrawer(
+          key: ValueKey<_GoldenDrawerKind>(kind),
+          settings: widget.settings,
+          onPresetPicked: (preset) {
+            unawaited(
+              widget.settingsNotifier.setVideoOutputPreset(preset),
+            );
+            widget.onVideoPresetChanged?.call(preset);
+          },
+          onClose: _closeDrawer,
         );
       case _GoldenDrawerKind.none:
         return const SizedBox.shrink();
@@ -1911,6 +1947,7 @@ class _BottomBar extends StatelessWidget {
     required this.fit,
     required this.onCycleFit,
     required this.onRotate,
+    this.onOpenVideo,
   });
 
   final VlcPlayerController controller;
@@ -1927,6 +1964,11 @@ class _BottomBar extends StatelessWidget {
   final VoidCallback onOpenSubtitleStyle;
   final VoidCallback onOpenAudioSources;
   final VoidCallback onOpenSources;
+
+  /// Opens the Video output-preset drawer (+57). Null where the panel
+  /// does not exist (Android) — the button never renders then.
+  final VoidCallback? onOpenVideo;
+
   final VoidCallback onPickVolume;
   final double speed;
   final VoidCallback onPickSpeed;
@@ -2033,6 +2075,17 @@ class _BottomBar extends StatelessWidget {
               tooltip: 'Sources',
               size: 38,
             ),
+            const SizedBox(width: 6),
+            // Video output presets (+57), beside Sources — the panel the
+            // Infuse screenshot shows. iOS mpv only: onOpenVideo is null
+            // on Android, and the button never renders then.
+            if (onOpenVideo != null)
+              GoldenIconButton(
+                icon: Icons.tune_rounded,
+                onPressed: onOpenVideo!,
+                tooltip: 'Video',
+                size: 38,
+              ),
             const SizedBox(width: 6),
             GoldenIconButton(
               icon: Icons.volume_up_rounded,

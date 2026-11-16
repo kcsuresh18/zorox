@@ -42,6 +42,12 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
   private var swLutPQPeak: Double?
   /// +47: same, while the HLG tone map is active (nil otherwise).
   private var swLutHLGPeak: Double?
+  /// +57: the `tone-mapping` value the PQ/HLG LUT was built for
+  /// ("clip", "bt.2390" or "auto"), read live each frame. A change
+  /// rebuilds the LUT at once, so a preset pick in the Video panel
+  /// changes the picture on the current video. Unreadable means
+  /// "clip" (see readToneMapping).
+  private var swLutToneMapping: String?
   private var swLutSize: CGSize?
   private var swLut: [UInt8]?
   private static let swLutIdentity: [UInt8] = (0...255).map { UInt8($0) }
@@ -244,6 +250,34 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     return String(cString: cStr)
   }
 
+  /// +57: the live `tone-mapping` option ("clip", "bt.2390",
+  /// "auto", ...), as the Video output preset set it on the hardware
+  /// path — the software renderer reads the same value to pick its
+  /// LUT, so one setting drives both paths. "clip" when mpv cannot
+  /// say (the option is registered globally so it should read; the
+  /// fallback is the current behaviour, no regression). Trimmed and
+  /// lowercased by the caller where it matters.
+  private func readToneMapping() -> String {
+    guard
+      let cStr = mpv_get_property_string(handle, "tone-mapping")
+    else { return "clip" }
+    defer { mpv_free(cStr) }
+    return String(cString: cStr)
+  }
+
+  /// +57: does a `tone-mapping` value mean the BT.2390 EETF? Mirrors
+  /// the Dart table (see swToneMapCurveForToneMapping in
+  /// mpv_ios_options.dart): `bt.2390` and `auto` mean the EETF (mpv's
+  /// `auto` maps to bt.2390 on vo=gpu); anything else — including an
+  /// unreadable property — means the clip, the safe default that
+  /// matches the hardware path's `tone-mapping: clip`.
+  private static func toneMappingIsEetf(_ value: String) -> Bool {
+    switch value.trimmingCharacters(in: .whitespaces).lowercased() {
+    case "bt.2390", "auto": return true
+    default: return false
+    }
+  }
+
   /// The file's peak luminance in nits, from video-params/sig-peak.
   /// mpv reports sig-peak relative to a 100-nit reference, so 10.0
   /// means a 1,000-nit master. Falls back to 1,000 nits when the
@@ -290,6 +324,41 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     return 1.055 * pow(l, 1.0 / 2.4) - 0.055
   }
 
+  // +57: the BT.2390 EETF helper, re-added from +46/+47 (removed in
+  // +50 when the clip became the only curve). The Video output preset
+  // selects it again: SDR tone mapped and Compatibility read
+  // `tone-mapping` bt.2390/auto and get the EETF LUT below; Native
+  // EDR and Custom-with-nothing-stored keep the clip. See
+  // toneMappingIsEetf for the table.
+  /// The BT.2390 EETF (see pqToneMapLutEetf): tone-maps a PQ code
+  /// (0..1), `masteringWhite` the PQ code of the source peak,
+  /// `maxLum` the display peak / source peak in PQ code words, `ks`
+  /// the knee. Returns the tone-mapped PQ code. Shared by the PQ LUT
+  /// and the HLG LUT (+47), so both HDR curves roll highlights off
+  /// identically.
+  private static func toneMapPQCode(
+    _ code: Double,
+    masteringWhite: Double,
+    maxLum: Double,
+    ks: Double
+  ) -> Double {
+    var p = code / masteringWhite
+    if p > 1.0 { p = 1.0 }
+    let p2: Double
+    if p <= ks || ks >= 1.0 {
+      p2 = p
+    } else {
+      let t = (p - ks) / (1.0 - ks)
+      let t2 = t * t
+      let t3 = t2 * t
+      p2 =
+        (2 * t3 - 3 * t2 + 1) * ks
+        + (t3 - 2 * t2 + t) * (1.0 - ks)
+        + (-2 * t3 + 3 * t2) * maxLum
+    }
+    return p2 * masteringWhite
+  }
+
   /// PQ (HDR) -> SDR tone-mapping LUT: per 8-bit PQ code, a hard clip
   /// at the 100-nit SDR white — the same curve as the hardware path's
   /// `tone-mapping: clip` (see kMpvIosOptions). +46 used a BT.2390
@@ -310,6 +379,42 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
       let code = Double(i) / 255.0
       // Absolute PQ code, clipped at the display white.
       let newCode = min(code, displayWhite)
+      // Absolute PQ code -> linear light (1.0 = 10,000 nits) -> relative
+      // to the 100-nit SDR white -> sRGB code value.
+      let linear = pqEotf(newCode) / 0.01
+      let s = srgbEncode(min(1.0, max(0.0, linear)))
+      return UInt8(max(0, min(255, (s * 255.0).rounded())))
+    }
+  }
+
+  /// PQ (HDR) -> SDR tone-mapping LUT, BT.2390 EETF version (+57):
+  /// per 8-bit PQ code, BT.2390 EETF in PQ space (verified against
+  /// the reference curve in +46: 100 nits in -> ~69 nits out, 1,000
+  /// nits in -> 100 nits out, for a 1,000-nit master on a 100-nit
+  /// display) then PQ-decode and sRGB-encode. The EETF works on the
+  /// PQ signal normalised by the mastering white: below the knee
+  /// (KS = 1.5*maxLum - 0.5, maxLum = display peak / source peak in
+  /// PQ code words) the signal passes 1:1, so shadows and diffuse
+  /// white stay bright; above it a Hermite spline rolls the
+  /// highlights off onto the display peak. A naive linear
+  /// scale-to-peak would darken diffuse white to ~35% grey instead.
+  /// HLG has its own LUT (see hlgToneMapLutEetf, +47) — same EETF,
+  /// different decode. Selected when the live `tone-mapping` is
+  /// bt.2390/auto (see toneMappingIsEetf).
+  private static func pqToneMapLutEetf(peakNits: Double) -> [UInt8] {
+    let masteringWhite = pqEncode(peakNits / 10000.0)
+    guard masteringWhite > 0 else { return swLutIdentity }
+    let displayWhite = pqEncode(0.01)  // 100 nits, the SDR white
+    let maxLum = min(1.0, displayWhite / masteringWhite)
+    let ks = max(0.0, min(1.0, 1.5 * maxLum - 0.5))
+    return (0...255).map { i in
+      let code = Double(i) / 255.0
+      let newCode = toneMapPQCode(
+        code,
+        masteringWhite: masteringWhite,
+        maxLum: maxLum,
+        ks: ks
+      )
       // Absolute PQ code -> linear light (1.0 = 10,000 nits) -> relative
       // to the 100-nit SDR white -> sRGB code value.
       let linear = pqEotf(newCode) / 0.01
@@ -358,15 +463,58 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     }
   }
 
+  /// HLG (HDR) -> SDR tone-mapping LUT, BT.2390 EETF version (+57):
+  /// per 8-bit HLG code, inverse HLG OETF to scene-linear light, the
+  /// reference HLG OOTF gamma (1.2) to display-linear light, scale by
+  /// the mastering peak, then the same BT.2390 EETF as the PQ LUT
+  /// (via toneMapPQCode — the HLG-derived light is PQ-encoded first,
+  /// so both HDR curves roll highlights off identically) and
+  /// sRGB-encode. HLG is scene-referred where PQ is absolute, so it
+  /// needs its own decode — reusing the PQ LUT's code values
+  /// directly would be wrong — but the tone-mapping curve is shared.
+  /// Verified numerically in +47: black -> 0, HLG mid (0.5) -> ~182,
+  /// diffuse white (0.75) -> ~242, peak -> 255, monotonic. Selected
+  /// when the live `tone-mapping` is bt.2390/auto (see
+  /// toneMappingIsEetf).
+  private static func hlgToneMapLutEetf(peakNits: Double) -> [UInt8] {
+    let masteringWhite = pqEncode(peakNits / 10000.0)
+    guard masteringWhite > 0 else { return swLutIdentity }
+    let displayWhite = pqEncode(0.01)  // 100 nits, the SDR white
+    let maxLum = min(1.0, displayWhite / masteringWhite)
+    let ks = max(0.0, min(1.0, 1.5 * maxLum - 0.5))
+    return (0...255).map { i in
+      let ePrime = Double(i) / 255.0
+      let sceneLinear = hlgInverseOetf(ePrime)
+      let displayLinear = pow(max(0.0, sceneLinear), 1.2)
+      let nits = displayLinear * peakNits
+      let code = pqEncode(min(1.0, max(0.0, nits / 10000.0)))
+      let newCode = toneMapPQCode(
+        code,
+        masteringWhite: masteringWhite,
+        maxLum: maxLum,
+        ks: ks
+      )
+      let linear = pqEotf(newCode) / 0.01
+      let s = srgbEncode(min(1.0, max(0.0, linear)))
+      return UInt8(max(0, min(255, (s * 255.0).rounded())))
+    }
+  }
+
   /// Maps the rendered frame's transfer function to sRGB, in place.
   /// Three cases, decided once per video size: a pure-power TRC
   /// (bt.1886 and friends) gets a power LUT, PQ (HDR) gets a
-  /// hard-clip LUT (see pqToneMapLut), and HLG (HDR) gets its own
-  /// hard-clip LUT (see hlgToneMapLut, +47). The clip is the same
-  /// curve as the hardware path's `tone-mapping: clip`, so PiP ON
-  /// and PiP OFF match. A no-op (apart from the property reads on
-  /// the first frame of a new size) when the source is already
-  /// sRGB-like, or an HDR/log curve this does not cover.
+  /// tone-mapping LUT (see pqToneMapLut / pqToneMapLutEetf), and HLG
+  /// (HDR) gets its own tone-mapping LUT (see hlgToneMapLut /
+  /// hlgToneMapLutEetf, +47). Which HDR curve — the hard clip or the
+  /// BT.2390 EETF — is the live `tone-mapping` value (see
+  /// toneMappingIsEetf), read every frame (+57): a preset pick in
+  /// the Video panel changes the LUT at once, on the current video.
+  /// The clip is the same curve as the hardware path's
+  /// `tone-mapping: clip`, so PiP ON and PiP OFF match on the
+  /// default preset. The SDR power LUT is unaffected by the preset.
+  /// A no-op (apart from the property reads on the first frame of a
+  /// new size) when the source is already sRGB-like, or an HDR/log
+  /// curve this does not cover.
   private func applySwGammaCorrection(
     size: CGSize,
     pitch: Int,
@@ -378,6 +526,20 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     // A new size is a new video, which may carry a different TRC.
     if swLutSize != size {
       swLutSize = size
+      swLutExponent = nil
+      swLutPQPeak = nil
+      swLutHLGPeak = nil
+      swLut = nil
+    }
+    // +57: the Video output preset's tone mapping, read live each
+    // frame. A change re-decides the whole LUT at once: resetting
+    // the exponent re-runs the gamma branch below, which re-reads
+    // the peak and rebuilds the LUT from the new curve — the
+    // picture changes on the current video, no re-open. The SDR
+    // power LUT is unaffected by the preset.
+    let toneMapping = readToneMapping()
+    if swLutToneMapping != toneMapping {
+      swLutToneMapping = toneMapping
       swLutExponent = nil
       swLutPQPeak = nil
       swLutHLGPeak = nil
@@ -401,11 +563,17 @@ public class TextureSW: NSObject, FlutterTexture, ResizableTextureProtocol {
     }
     if let peak = swLutPQPeak {
       if swLut == nil {
-        swLut = Self.pqToneMapLut(peakNits: peak)
+        // +57: the EETF when the live tone-mapping is bt.2390/auto,
+        // the clip otherwise (the default preset).
+        swLut = Self.toneMappingIsEetf(swLutToneMapping ?? "clip")
+          ? Self.pqToneMapLutEetf(peakNits: peak)
+          : Self.pqToneMapLut(peakNits: peak)
       }
     } else if let hlgPeak = swLutHLGPeak {
       if swLut == nil {
-        swLut = Self.hlgToneMapLut(peakNits: hlgPeak)
+        swLut = Self.toneMappingIsEetf(swLutToneMapping ?? "clip")
+          ? Self.hlgToneMapLutEetf(peakNits: hlgPeak)
+          : Self.hlgToneMapLut(peakNits: hlgPeak)
       }
     } else {
       guard let exponent = swLutExponent, exponent > 1.0 else { return }

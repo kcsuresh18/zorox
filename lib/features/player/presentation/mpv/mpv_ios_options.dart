@@ -81,6 +81,8 @@ library;
 import 'package:flutter/foundation.dart';
 import 'package:media_kit/media_kit.dart';
 
+import '../../../settings/presentation/player_settings_provider.dart';
+
 /// The iOS-only mpv options, as `option → value`.
 /// The reconnect options (+49): iOS kills the HTTP socket while the app
 /// is suspended, so on return mpv sits in a read timeout before it can
@@ -241,6 +243,149 @@ IosResumeAction iosResumeAction({
 }) {
   if (!wasBackgrounded || inPip || !wasPlaying) return IosResumeAction.none;
   return is4K ? IosResumeAction.reopen4K : IosResumeAction.plainResume;
+}
+
+/// The iOS Video output preset's render options (+57).
+///
+/// The full render configuration for a preset, as `option → value`,
+/// applied on top of [kMpvIosOptions] — every preset carries the WHOLE
+/// render set (tone mapping + target peak + scalers), so switching
+/// presets is always a deterministic state: picking Native EDR after
+/// Compatibility restores the cheap scalers, it does not leave lanczos
+/// behind.
+///
+/// Hardware path (PiP OFF, gl_video): these are real mpv options,
+/// applied live via setProperty — the picture changes at once, no
+/// re-open. Software path (PiP ON, TextureSW): the scaler options are
+/// no-ops there (libswscale); the tone-mapping curve is honoured through
+/// the LUT, which reads the `tone-mapping` value (see
+/// [swToneMapCurveForToneMapping] and TextureSW.swift).
+///
+/// The mapping (mpv manual, verified 2026-11-16):
+/// - `tone-mapping: auto` (the default) maps to bt.2390 on vo=gpu, so
+///   Compatibility's `auto` and SDR tone mapped's `bt.2390` are the SAME
+///   curve — Compatibility differs from SDR tone mapped only in the
+///   scalers (mpv defaults vs the +34 cheap ones).
+/// - `target-peak: auto` (the default) picks the peak from the TRC.
+/// - `scale` defaults to lanczos, `dscale` to hermite, `cscale` unset
+///   follows scale, `dither-depth` defaults to auto,
+///   `correct-downscaling` is enabled by default, `deband` is a flag
+///   defaulting to no.
+/// - `hdr-compute-peak` is deliberately NOT set by any preset: it blacks
+///   the video with vo=libmpv (media_kit forces it off).
+///
+/// Native EDR is `clip` on both paths — the behaviour every install
+/// already had (clip on both paths since +50) — so the default preset
+/// changes nothing on upgrade. SDR tone mapped is the bt.2390 reference
+/// curve on both paths (the hardware option + the software EETF LUT),
+/// which is what makes PiP ON match PiP OFF for that preset, the +50
+/// principle. Pure, so it is unit-tested (see
+/// `mpv_video_output_preset_test.dart`).
+Map<String, String> videoOutputPresetOptions(
+  VideoOutputPreset preset, {
+  String? customToneMapping,
+  String? customTargetPeak,
+}) {
+  // The +34 cheap render: the fastest scaler, no deband, no dither, no
+  // extra downscale pass. The base for every preset except Compatibility.
+  const cheapScalers = <String, String>{
+    'scale': 'bilinear',
+    'cscale': 'bilinear',
+    'dscale': 'bilinear',
+    'deband': 'no',
+    'dither-depth': 'no',
+    'correct-downscaling': 'no',
+  };
+  // mpv's own defaults: the render before the +34 cheap-scalers.
+  const defaultScalers = <String, String>{
+    'scale': 'lanczos',
+    'cscale': 'lanczos',
+    'dscale': 'hermite',
+    'deband': 'no',
+    'dither-depth': 'auto',
+    'correct-downscaling': 'yes',
+  };
+  final toneMapping = videoOutputPresetToneMapping(
+    preset,
+    customToneMapping: customToneMapping,
+  );
+  final targetPeak = preset == VideoOutputPreset.custom
+      ? (customTargetPeak ?? 'auto')
+      : 'auto';
+  final scalers = preset == VideoOutputPreset.compatibility
+      ? defaultScalers
+      : cheapScalers;
+  return <String, String>{
+    'tone-mapping': toneMapping,
+    'target-peak': targetPeak,
+    ...scalers,
+  };
+}
+
+/// The `tone-mapping` value a preset selects (+57).
+///
+/// The single value the software renderer reads to pick its LUT (see
+/// [swToneMapCurveForToneMapping]): the hardware path gets the same value
+/// through [videoOutputPresetOptions], so one setting drives both paths.
+/// Custom with nothing stored falls back to `clip` (Native EDR).
+String videoOutputPresetToneMapping(
+  VideoOutputPreset preset, {
+  String? customToneMapping,
+}) => switch (preset) {
+  VideoOutputPreset.nativeEdr => 'clip',
+  VideoOutputPreset.sdrToneMapped => 'bt.2390',
+  VideoOutputPreset.compatibility => 'auto',
+  VideoOutputPreset.custom => customToneMapping ?? 'clip',
+};
+
+/// Which software LUT curve a `tone-mapping` value means (+57).
+///
+/// TextureSW.swift mirrors this table exactly: it reads the live
+/// `tone-mapping` property once per video size and picks the LUT —
+/// `clip` is the hard clip at the 100-nit SDR white (+50), `eetf` is the
+/// BT.2390 roll-off re-added from +46/+47. `bt.2390` and `auto` both mean
+/// the EETF (mpv's `auto` maps to bt.2390 on vo=gpu); every other value —
+/// including an unreadable property — means the clip, the safe default
+/// that matches the hardware path's `tone-mapping: clip`. Pure, so it is
+/// unit-tested (see `mpv_video_output_preset_test.dart`).
+enum SwToneMapCurve { clip, eetf }
+
+SwToneMapCurve swToneMapCurveForToneMapping(String toneMapping) =>
+    switch (toneMapping.trim().toLowerCase()) {
+      'bt.2390' || 'auto' => SwToneMapCurve.eetf,
+      _ => SwToneMapCurve.clip,
+    };
+
+/// Applies a Video output preset's options to a player's mpv instance
+/// (+57). Same best-effort shape as [applyMpvIosOptions]: a single
+/// option failing must not break the open, and the tone-mapping
+/// read-back shows what was set. Call after [applyMpvIosOptions] — the
+/// preset overrides the base `tone-mapping: clip` and the +34 scalers
+/// where the preset says otherwise.
+Future<void> applyVideoOutputPresetOptions(
+  NativePlayer platform,
+  VideoOutputPreset preset, {
+  String? customToneMapping,
+  String? customTargetPeak,
+}) async {
+  final options = videoOutputPresetOptions(
+    preset,
+    customToneMapping: customToneMapping,
+    customTargetPeak: customTargetPeak,
+  );
+  for (final entry in options.entries) {
+    try {
+      await platform.setProperty(entry.key, entry.value);
+    } catch (e) {
+      debugPrint('[mpv] video preset option ${entry.key} not applied: $e');
+    }
+  }
+  try {
+    final toneMapping = await platform.getProperty('tone-mapping');
+    debugPrint('[mpv] video preset ${preset.name}: tone-mapping=$toneMapping');
+  } catch (e) {
+    debugPrint('[mpv] video preset tone-mapping read-back failed: $e');
+  }
 }
 
 /// Applies [kMpvIosOptions] to a player's mpv instance, then reads the

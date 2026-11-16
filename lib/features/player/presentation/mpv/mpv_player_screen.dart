@@ -968,6 +968,29 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
     return parsed?.toInt();
   }
 
+  /// Applies a Video output preset to the live mpv instance (+57):
+  /// the picture changes on the current video, no re-open, no seek.
+  /// The custom values come from the live settings — the Custom
+  /// preset's stored tone-mapping / target peak, null when never set
+  /// (Custom then behaves as Native EDR). Best-effort: a setProperty
+  /// failing must not break playback, and the read-back log shows what
+  /// actually landed (see [applyVideoOutputPresetOptions]).
+  Future<void> _applyVideoOutputPreset(VideoOutputPreset preset) async {
+    try {
+      final platform = _player.platform;
+      if (platform is! NativePlayer) return;
+      final settings = _playerSettings.value;
+      await applyVideoOutputPresetOptions(
+        platform,
+        preset,
+        customToneMapping: settings.videoCustomToneMapping,
+        customTargetPeak: settings.videoCustomTargetPeak,
+      );
+    } catch (_) {
+      // A preset failing to apply must never break playback.
+    }
+  }
+
   /// +55 stall fallback: the plain pause/resume on Home → return relies
   /// on mpv's own reconnect (`reconnect=1`, see [kMpvIosOptions]) to
   /// re-establish the socket iOS killed while suspended. If the stream
@@ -1554,6 +1577,16 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       final iosPlatform = _player.platform;
       if (iosPlatform is NativePlayer) {
         await applyMpvIosOptions(iosPlatform);
+        // The stored Video output preset (+57), applied after the base
+        // options: the preset overrides the base `tone-mapping: clip`
+        // and the +34 scalers where it says otherwise, so the next open
+        // starts on the same preset the viewer picked.
+        await applyVideoOutputPresetOptions(
+          iosPlatform,
+          settings.videoOutputPreset,
+          customToneMapping: settings.videoCustomToneMapping,
+          customTargetPeak: settings.videoCustomTargetPeak,
+        );
       }
     }
     // Subtitle options for every platform (+26): mpv's `secondary-sid`
@@ -2460,6 +2493,10 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
       'video-params/w',
       'video-params/h',
       'video-params/gamma',
+      // The Video output preset's tone mapping (+57): the QoE overlay
+      // shows which curve the live instance is running, so a phone
+      // test can verify a preset pick actually landed.
+      'tone-mapping',
       'video-out-params/w',
       'video-out-params/h',
       'vf',
@@ -3554,6 +3591,13 @@ class _MpvPlayerScreenState extends ConsumerState<MpvPlayerScreen>
                 // the button never renders.
                 onEnterPip: _pipAvailable
                     ? () => unawaited(_enterPip(fromButton: true))
+                    : null,
+                // Video output presets (+57): iOS mpv only — the panel
+                // and its live apply exist on no other platform, so the
+                // button never renders elsewhere.
+                onVideoPresetChanged:
+                    defaultTargetPlatform == TargetPlatform.iOS
+                    ? _applyVideoOutputPreset
                     : null,
               ),
             ),
