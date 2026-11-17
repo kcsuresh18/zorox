@@ -286,22 +286,28 @@ class _AddonCatalogsTabViewState extends ConsumerState<AddonCatalogsTabView>
     );
 
     if (!state.isLoading && state.enabled.isEmpty) {
-      return const _EmptyHint(
+      // Explore's only source since +58: with no add-on installed the
+      // screen must offer the way to add one, not just say so.
+      return _EmptyHint(
         icon: Icons.dashboard_customize_outlined,
         title: 'No add-ons yet',
         message:
             'Open "My add-ons" and install Cinemeta for catalogs, then pick a '
             'stream add-on in Discover — two taps and this tab fills up.',
+        actionLabel: AppLocalizations.of(context)!.stremioAddons,
+        onAction: () => const AddonsRoute().go(context),
       );
     }
 
     if (catalogs.isEmpty) {
-      return const _EmptyHint(
+      return _EmptyHint(
         icon: Icons.grid_view_rounded,
         title: 'No catalogs',
         message:
             'None of your add-ons publish browsable catalogs. '
             'Cinemeta or a streaming-catalogs add-on will fill this.',
+        actionLabel: AppLocalizations.of(context)!.stremioAddons,
+        onAction: () => const AddonsRoute().go(context),
       );
     }
 
@@ -1044,10 +1050,17 @@ class _EmptyHint extends StatelessWidget {
   final String title;
   final String message;
 
+  /// Optional button under the message (e.g. "Stremio add-ons" opening
+  /// the add-on manager). Both must be set for it to show.
+  final String? actionLabel;
+  final VoidCallback? onAction;
+
   const _EmptyHint({
     required this.icon,
     required this.title,
     required this.message,
+    this.actionLabel,
+    this.onAction,
   });
 
   @override
@@ -1070,6 +1083,15 @@ class _EmptyHint extends StatelessWidget {
                 color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
+            if (actionLabel != null && onAction != null) ...[
+              const SizedBox(height: 18),
+              FilledButton.icon(
+                key: const ValueKey('explore-empty-add-addons'),
+                onPressed: onAction,
+                icon: const Icon(Icons.add_rounded),
+                label: Text(actionLabel!),
+              ),
+            ],
           ],
         ),
       ),

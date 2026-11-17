@@ -1,13 +1,15 @@
+import 'dart:io';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:skystream/core/config/tmdb_config.dart';
 import 'package:skystream/features/explore/data/explore_mode_provider.dart';
 
-/// The Explore Source picker must open without a TMDB key: with no key
-/// saved the default source falls back to one that works key-free
-/// (Stremio Add-ons), a saved Anime/Stremio mode is kept, and a saved
-/// Movies & Shows mode falls back without losing the saved preference.
+/// +58: Explore has ONE source, Stremio Add-ons. The TMDB "Movies &
+/// Shows" and AniList "Anime" sources are gone, so whatever an older
+/// build saved, with or without a TMDB key, Explore opens on Stremio
+/// Add-ons and the saved preference is migrated.
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
@@ -28,51 +30,85 @@ void main() {
     return container;
   }
 
-  /// Lets the provider's async persisted-mode load finish. The load goes
-  /// through a platform-channel call, so it needs a real (short) delay,
-  /// not just microtasks.
+  /// Lets the provider's async migration finish. It goes through a
+  /// platform-channel call, so it needs a real (short) delay.
   Future<void> settleLoad() async {
     await Future<void>.delayed(const Duration(milliseconds: 200));
   }
 
-  test('no key and no saved mode starts on Stremio Add-ons', () {
+  test('no key and no saved mode opens on Stremio Add-ons', () async {
     final container = containerWith();
+    expect(container.read(exploreModeProvider), ExploreModeType.stremio);
+    await settleLoad();
     expect(container.read(exploreModeProvider), ExploreModeType.stremio);
   });
 
-  test('no key and a saved anime mode keeps anime', () async {
+  test('a saved anime mode is migrated to Stremio Add-ons', () async {
     final container = containerWith(
       prefs: {'explore_mode_type': 'anime'},
     );
-    // Read once to start the provider (and its async persisted-mode
-    // load); the second read, after the load, is the settled state.
-    container.read(exploreModeProvider);
+    expect(container.read(exploreModeProvider), ExploreModeType.stremio);
     await settleLoad();
-    expect(container.read(exploreModeProvider), ExploreModeType.anime);
+    expect(container.read(exploreModeProvider), ExploreModeType.stremio);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('explore_mode_type'), 'stremio');
   });
 
-  test(
-    'no key and a saved movies mode falls back to Stremio '
-    'without overwriting the save',
-    () async {
-      final container = containerWith(
-        prefs: {'explore_mode_type': 'movies'},
-      );
-      container.read(exploreModeProvider);
-      await settleLoad();
-      expect(container.read(exploreModeProvider), ExploreModeType.stremio);
-      final prefs = await SharedPreferences.getInstance();
-      expect(prefs.getString('explore_mode_type'), 'movies');
-    },
-  );
+  test('a saved movies mode is migrated, with no TMDB key', () async {
+    final container = containerWith(
+      prefs: {'explore_mode_type': 'movies'},
+    );
+    expect(container.read(exploreModeProvider), ExploreModeType.stremio);
+    await settleLoad();
+    expect(container.read(exploreModeProvider), ExploreModeType.stremio);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('explore_mode_type'), 'stremio');
+  });
 
-  test('with a key, a saved movies mode stays movies', () async {
+  test('a saved movies mode is migrated even WITH a TMDB key', () async {
     TmdbConfig.setUserApiKey('0123456789abcdef0123456789abcdef');
     final container = containerWith(
       prefs: {'explore_mode_type': 'movies'},
     );
-    container.read(exploreModeProvider);
+    expect(container.read(exploreModeProvider), ExploreModeType.stremio);
     await settleLoad();
-    expect(container.read(exploreModeProvider), ExploreModeType.movies);
+    expect(container.read(exploreModeProvider), ExploreModeType.stremio);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('explore_mode_type'), 'stremio');
+  });
+
+  test('the legacy anime boolean is cleared and does not select anime',
+      () async {
+    final container = containerWith(
+      prefs: {'explore_mode_is_anime': true},
+    );
+    expect(container.read(exploreModeProvider), ExploreModeType.stremio);
+    await settleLoad();
+    expect(container.read(exploreModeProvider), ExploreModeType.stremio);
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.containsKey('explore_mode_is_anime'), isFalse);
+  });
+
+  test('setMode can no longer select a removed source', () async {
+    final container = containerWith();
+    final notifier = container.read(exploreModeProvider.notifier);
+    notifier.setMode(ExploreModeType.movies);
+    expect(container.read(exploreModeProvider), ExploreModeType.stremio);
+    notifier.setMode(ExploreModeType.anime);
+    expect(container.read(exploreModeProvider), ExploreModeType.stremio);
+    await settleLoad();
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('explore_mode_type'), 'stremio');
+  });
+
+  test('the Explore Source picker dialog no longer exists', () {
+    // Guard against the picker coming back: its file was deleted in +58.
+    expect(
+      File(
+        'lib/features/explore/presentation/widgets/'
+        'explore_mode_selector_dialog.dart',
+      ).existsSync(),
+      isFalse,
+    );
   });
 }

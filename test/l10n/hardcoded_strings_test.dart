@@ -163,7 +163,6 @@ const Map<String, int> _budget = <String, int>{
   'lib/features/details/presentation/details_screen.dart': 4,
   'lib/features/explore/presentation/anilist_explore_screen.dart': 1,
   'lib/features/explore/presentation/explore_screen.dart': 1,
-  'lib/features/explore/presentation/widgets/explore_mode_selector_dialog.dart': 2,
   'lib/features/extensions/screens/extensions_screen.dart': 1,
   'lib/features/extensions/screens/plugin_settings_dialog.dart': 4,
   'lib/features/home/presentation/delegates/home_search_delegate.dart': 1,

@@ -4,21 +4,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../features/explore/presentation/explore_screen.dart';
 import '../../../features/settings/presentation/general_settings_provider.dart';
 
-/// Browse: the world's movies, as the fifth tab (replaces the Detail tab
-/// in ZoroX v4).
+/// Browse: the fifth tab (replaces the Detail tab in ZoroX v4).
 ///
-/// This tab is the full Explore/discover page. With a TMDB API key
-/// configured it shows TMDB trending, popular and top-rated, with its
-/// filters and genres — and it is reachable WITHOUT a key too: the
-/// Explore Source picker opens with no key saved, Anime (AniList) and
-/// Stremio Add-ons work directly, and only the Movies & Shows source
-/// asks for the key (its own prompt on the Explore page). No key is
-/// baked into the app; the key is the user's own, from Settings.
-/// (Set the key in Settings OR from the Movies & Shows prompt; either
-/// way the tab flips to TMDB immediately, no restart.)
-///
-/// While the key is set, the page header reads "Explore": that is the
-/// discover page's own title, and the tab itself reads "Browse".
+/// This tab is the Explore page. Since +58 Explore has ONE source —
+/// Stremio Add-ons (catalogs from the user's installed add-ons); the
+/// TMDB "Movies & Shows" and AniList "Anime" sources and the Explore
+/// Source picker were removed at the user's request. It needs no TMDB
+/// key to open. The page header reads "Explore"; the tab reads "Browse".
 class BrowseScreen extends ConsumerWidget {
   const BrowseScreen({super.key});
 
